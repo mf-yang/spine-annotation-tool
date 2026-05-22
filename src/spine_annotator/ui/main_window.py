@@ -1,17 +1,16 @@
 """Main application window for the spine annotation tool."""
 
-import json
 import math
 import os
 from pathlib import Path
 from typing import List, Optional
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QKeySequence
+from PyQt5.QtGui import QBrush, QColor, QKeySequence
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QShortcut,
+    QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QRadioButton, QShortcut,
     QVBoxLayout, QWidget,
 )
 
@@ -148,6 +147,26 @@ class MainWindow(QMainWindow):
         self._ann_info_label.setWordWrap(True)
         right_layout.addWidget(self._ann_info_label)
 
+        # Keypoint visibility (YOLOv8-pose v 字段，对该标注 4 个角点统一生效)
+        right_layout.addWidget(self._create_section_label("关键点可见性"))
+        vis_row = QHBoxLayout()
+        self._vis_group = QButtonGroup(self)
+        self._rb_vis_2 = QRadioButton("可见 (2)")
+        self._rb_vis_1 = QRadioButton("遮挡 (1)")
+        self._rb_vis_0 = QRadioButton("不可见 (0)")
+        self._rb_vis_2.setToolTip("肉眼清晰可见，是默认值")
+        self._rb_vis_1.setToolTip("被金属植入物 / 伪影遮挡，坐标可信")
+        self._rb_vis_0.setToolTip("肉眼无法看清（脊柱骨过于透明），坐标基于相邻椎骨推断")
+        self._vis_group.addButton(self._rb_vis_2, 2)
+        self._vis_group.addButton(self._rb_vis_1, 1)
+        self._vis_group.addButton(self._rb_vis_0, 0)
+        self._rb_vis_2.setChecked(True)
+        vis_row.addWidget(self._rb_vis_2)
+        vis_row.addWidget(self._rb_vis_1)
+        vis_row.addWidget(self._rb_vis_0)
+        right_layout.addLayout(vis_row)
+        self._vis_group.buttonClicked.connect(self._on_visibility_changed)
+
         # Rotation controls
         right_layout.addWidget(self._create_section_label("旋转微调"))
         rotate_row = QHBoxLayout()
@@ -205,6 +224,8 @@ class MainWindow(QMainWindow):
             "移动: W/A/S/D 5px\n"
             "精移: Shift+W/A/S/D 1px\n"
             "导航: ←/→ 图片 | ↑/↓ 标注\n"
+            "跳转: Ctrl+N 下一未标注\n"
+            "      Ctrl+B 上一未标注\n"
             "其他: F 适配 | Esc 取消\n"
             "      Ctrl+S 保存"
         )
@@ -269,12 +290,20 @@ class MainWindow(QMainWindow):
             QKeySequence("Ctrl+Z"): self._undo,
             QKeySequence("Escape"): lambda: self._canvas.select_annotation(-1),
             QKeySequence("F"): self._fit_view,
+            # 跳到下一张 / 上一张未标注图片（断点续标核心快捷键）
+            QKeySequence("Ctrl+N"): self._jump_to_next_unannotated,
+            QKeySequence("Ctrl+B"): self._jump_to_prev_unannotated,
         }
         for key, callback in shortcuts.items():
             shortcut = QShortcut(key, self)
             shortcut.activated.connect(callback)
 
     def _init_statusbar(self):
+        # 永久显示在右侧的"进度统计"标签（已标注 N/Total · X%）
+        self._progress_label = QLabel("")
+        self._progress_label.setStyleSheet("color: #2c7be5; font-weight: bold;")
+        self.statusBar().addPermanentWidget(self._progress_label)
+        # 永久显示在最右侧的"当前图片"信息
         self._status_label = QLabel("")
         self.statusBar().addPermanentWidget(self._status_label)
 
@@ -306,17 +335,15 @@ class MainWindow(QMainWindow):
         # Load progress cache
         self._cache = self._converter.load_progress_cache(self._progress_cache_path)
 
-        # Populate list
+        # Populate list (颜色按缓存状态决定)
         self._image_list_widget.clear()
-        for info in self._image_infos:
+        for idx, info in enumerate(self._image_infos):
             name = Path(info["image_path"]).stem
             split = info.get("split", "")
             display = f"[{split}] {name}" if split else name
             item = QListWidgetItem(display)
-            # Mark if already processed
-            if self._cache.get(info["image_path"], {}).get("saved"):
-                item.setForeground(Qt.gray)
             self._image_list_widget.addItem(item)
+            self._apply_item_style(idx)
 
         self._progress_bar.setMaximum(len(self._image_infos))
         self._update_progress()
@@ -324,8 +351,46 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已扫描 {len(self._image_infos)} 张图片")
         self._btn_save_all.setEnabled(True)
 
-        if self._image_infos:
-            self._go_to_image(0)
+        # 智能跳转：1) 优先恢复 last_image_path  2) 否则跳到第一张未标注
+        target_index = self._resolve_initial_index()
+        if target_index >= 0:
+            self._go_to_image(target_index)
+
+    def _resolve_initial_index(self) -> int:
+        """决定打开数据集后应该跳转到哪张图片。
+
+        策略：
+        1. 如果 cache 中记录了 last_image_path 且该图片仍存在于扫描结果中：
+           - 若该图片**未标注**，直接跳过去（用户继续上次的工作）
+           - 若已标注，转入策略 2
+        2. 跳到第一张未标注图片
+        3. 全部已标注：跳回 last_image_path 或第一张
+        """
+        if not self._image_infos:
+            return -1
+
+        last_path = self._converter.get_last_image_path(self._cache)
+        last_index = -1
+        if last_path:
+            for i, info in enumerate(self._image_infos):
+                if info["image_path"] == last_path:
+                    last_index = i
+                    break
+
+        # 优先：上次位置且未标注
+        if last_index >= 0 and not self._is_saved(self._image_infos[last_index]["image_path"]):
+            return last_index
+
+        # 其次：第一张未标注
+        for i, info in enumerate(self._image_infos):
+            if not self._is_saved(info["image_path"]):
+                return i
+
+        # 兜底：全部已标注 → 上次位置或第一张
+        return last_index if last_index >= 0 else 0
+
+    def _is_saved(self, image_path: str) -> bool:
+        return bool(self._cache.get(image_path, {}).get("saved"))
 
     def _set_output_dir(self):
         """Set the output directory for exported annotations."""
@@ -356,6 +421,7 @@ class MainWindow(QMainWindow):
         if self._current_index >= 0 and self._current_annotation and self._current_annotation.modified:
             self._save_current(silent=True)
 
+        prev_index = self._current_index
         self._current_index = index
         info = self._image_infos[index]
 
@@ -371,6 +437,17 @@ class MainWindow(QMainWindow):
 
         self._image_list_widget.setCurrentRow(index)
         self._canvas.load_image(info["image_path"], self._current_annotation.annotations)
+
+        # 记录最后访问位置 + 落盘（便于断点续标）
+        if self._progress_cache_path:
+            self._converter.set_last_image_path(self._cache, info["image_path"])
+            self._converter.save_progress_cache(self._progress_cache_path, self._cache)
+
+        # 切换前后两行的视觉样式（更新加粗状态）
+        if prev_index >= 0 and prev_index != index:
+            self._apply_item_style(prev_index)
+        self._apply_item_style(index)
+
         self._update_status()
 
     def _prev_image(self):
@@ -414,6 +491,7 @@ class MainWindow(QMainWindow):
         """Update info panel when selection changes."""
         if index < 0 or not self._current_annotation:
             self._ann_info_label.setText("无选中")
+            self._sync_visibility_radios(default_v=2, enabled=False)
             return
 
         # Map scene index to original annotation index
@@ -425,16 +503,55 @@ class MainWindow(QMainWindow):
         if 0 <= orig_idx < len(self._current_annotation.annotations):
             ann = self._current_annotation.annotations[orig_idx]
             angle_deg = math.degrees(ann.angle)
+            v_label = {2: "可见", 1: "遮挡", 0: "不可见"}.get(
+                int(ann.keypoint_visibility), "可见"
+            )
             self._ann_info_label.setText(
                 f"类别: {ann.class_name} (ID={ann.class_id})\n"
                 f"角度: {angle_deg:.1f}°\n"
                 f"尺寸: {ann.width:.0f} x {ann.height:.0f}\n"
-                f"中心: ({ann.center.x:.0f}, {ann.center.y:.0f})"
+                f"中心: ({ann.center.x:.0f}, {ann.center.y:.0f})\n"
+                f"可见性: v={int(ann.keypoint_visibility)} ({v_label})"
             )
             # Update angle spinbox without triggering signal
             self._angle_spin.blockSignals(True)
             self._angle_spin.setValue(angle_deg)
             self._angle_spin.blockSignals(False)
+            # Sync visibility radio buttons
+            self._sync_visibility_radios(int(ann.keypoint_visibility), enabled=True)
+
+    def _sync_visibility_radios(self, default_v: int, enabled: bool):
+        """同步右侧"关键点可见性" radio button 至给定 v 值（不触发回调）。"""
+        self._vis_group.blockSignals(True)
+        btn = self._vis_group.button(default_v)
+        if btn is not None:
+            btn.setChecked(True)
+        for v in (0, 1, 2):
+            b = self._vis_group.button(v)
+            if b is not None:
+                b.setEnabled(enabled)
+        self._vis_group.blockSignals(False)
+
+    def _on_visibility_changed(self, button):
+        """用户切换关键点可见性 radio button 时回调。"""
+        ann = self._canvas.get_selected_annotation()
+        if ann is None:
+            return
+        new_v = self._vis_group.id(button)
+        if int(ann.keypoint_visibility) == new_v:
+            return
+        ann.keypoint_visibility = new_v
+        if self._current_annotation:
+            self._current_annotation.modified = True
+        # 重绘画布（边框样式可能变化）+ 刷新信息面板
+        if 0 <= self._canvas._current_selection < len(self._canvas._obb_items):
+            self._canvas._obb_items[self._canvas._current_selection].update()
+        self._canvas.viewport().update()
+        self._on_annotation_selected(self._canvas._current_selection)
+        self._update_status()
+        # 列表项状态颜色更新（modified 状态变化）
+        if self._current_index >= 0:
+            self._apply_item_style(self._current_index)
 
     def _on_annotation_modified(self):
         """Mark current image as modified."""
@@ -442,6 +559,8 @@ class MainWindow(QMainWindow):
             self._current_annotation.modified = True
             self._on_annotation_selected(self._canvas._current_selection)
             self._update_status()
+            if self._current_index >= 0:
+                self._apply_item_style(self._current_index)
 
     def _on_layer_changed(self):
         """Handle layer visibility checkbox changes."""
@@ -511,11 +630,14 @@ class MainWindow(QMainWindow):
         else:  # yolov8_pose
             self._converter.save_pose_yolov8(self._current_annotation, out_dir, overwrite=True)
 
-        # Update cache
+        # Update cache (含每个标注的 keypoint_visibility 状态)
         img_path = info["image_path"]
         self._cache[img_path] = {
             "modified": False,
             "saved": True,
+            "annotation_states": self._converter.build_annotation_states(
+                self._current_annotation
+            ),
         }
         self._current_annotation.modified = False
 
@@ -523,8 +645,9 @@ class MainWindow(QMainWindow):
         self._converter.save_progress_cache(self._progress_cache_path, self._cache)
 
         # Update UI
-        self._image_list_widget.item(self._current_index).setForeground(Qt.gray)
+        self._apply_item_style(self._current_index)
         self._update_progress()
+        self._update_status()
 
         if not silent:
             self.statusBar().showMessage(f"已保存: {Path(img_path).name}")
@@ -563,30 +686,155 @@ class MainWindow(QMainWindow):
                 else:  # yolov8_pose
                     self._converter.save_pose_yolov8(ann, out_dir, overwrite=True)
 
-                self._cache[img_path] = {"modified": False, "saved": True}
+                self._cache[img_path] = {
+                    "modified": False,
+                    "saved": True,
+                    "annotation_states": self._converter.build_annotation_states(ann),
+                }
                 count += 1
 
         # Save cache
         self._converter.save_progress_cache(self._progress_cache_path, self._cache)
         self._update_progress()
+        # 刷新所有列表项样式
+        for i in range(len(self._image_infos)):
+            self._apply_item_style(i)
 
         self.statusBar().showMessage(f"已导出 {count} 个标注文件")
 
     def _update_progress(self):
-        """Update progress bar based on saved count."""
-        saved = sum(1 for v in self._cache.values() if v.get("saved"))
+        """Update progress bar + 永久进度标签。"""
+        saved = self._count_saved()
         total = len(self._image_infos)
-        self._progress_bar.setMaximum(total)
+        self._progress_bar.setMaximum(max(total, 1))
         self._progress_bar.setValue(saved)
+        if total > 0:
+            pct = saved / total * 100
+            self._progress_label.setText(
+                f"已标注 {saved} / {total}  ·  {pct:.1f}%"
+            )
+        else:
+            self._progress_label.setText("")
+
+    def _count_saved(self) -> int:
+        return sum(
+            1 for k, v in self._cache.items()
+            if k != YOLOConverter.META_KEY and isinstance(v, dict) and v.get("saved")
+        )
 
     def _update_status(self):
         """Update status bar info."""
         if not self._image_infos or not self._current_annotation:
+            self._status_label.setText("")
             return
         info = self._image_infos[self._current_index]
-        modified_str = " [已修改]" if self._current_annotation.modified else ""
+        modified_str = " [未保存]" if self._current_annotation.modified else ""
+        saved_str = " ✓" if self._is_saved(info["image_path"]) else ""
         self._status_label.setText(
             f"{self._current_index + 1}/{len(self._image_infos)} | "
-            f"{Path(info['image_path']).name} | "
+            f"{Path(info['image_path']).name}{saved_str} | "
             f"{len(self._current_annotation.annotations)} 个标注{modified_str}"
         )
+
+    # --- 列表项三态视觉样式 ---
+
+    def _apply_item_style(self, index: int):
+        """更新单个列表项的颜色 + 加粗状态。
+
+        三态颜色：
+          - 已修改未保存：橙色（最显眼，提醒用户保存）
+          - 已保存：灰色
+          - 未标注：默认黑色
+        当前选中项额外加粗。
+        """
+        if not (0 <= index < self._image_list_widget.count()):
+            return
+        item = self._image_list_widget.item(index)
+        if item is None:
+            return
+
+        info = self._image_infos[index]
+        img_path = info["image_path"]
+        is_current = (index == self._current_index)
+        is_modified = (
+            is_current
+            and self._current_annotation is not None
+            and self._current_annotation.modified
+        )
+        is_saved = self._is_saved(img_path)
+
+        if is_modified:
+            item.setForeground(QBrush(QColor("#e8590c")))   # 橙色
+        elif is_saved:
+            item.setForeground(QBrush(QColor("#888888")))   # 灰色
+        else:
+            item.setForeground(QBrush(QColor("#000000")))   # 默认黑色
+
+        font = item.font()
+        font.setBold(is_current)
+        item.setFont(font)
+
+    # --- 断点续标：跳转未标注图片 ---
+
+    def _jump_to_next_unannotated(self):
+        """从当前位置往后找下一张未标注图片。"""
+        if not self._image_infos:
+            return
+        start = max(self._current_index + 1, 0)
+        n = len(self._image_infos)
+        # 先从 start 找到末尾，再从开头找到 start（环绕）
+        for offset in range(n):
+            i = (start + offset) % n
+            if not self._is_saved(self._image_infos[i]["image_path"]):
+                self._go_to_image(i)
+                self.statusBar().showMessage(
+                    f"跳转到第 {i + 1} 张未标注图片", 2000
+                )
+                return
+        self.statusBar().showMessage("已全部标注完成 🎉", 3000)
+
+    def _jump_to_prev_unannotated(self):
+        """从当前位置往前找上一张未标注图片。"""
+        if not self._image_infos:
+            return
+        start = self._current_index - 1
+        n = len(self._image_infos)
+        for offset in range(n):
+            i = (start - offset) % n
+            if not self._is_saved(self._image_infos[i]["image_path"]):
+                self._go_to_image(i)
+                self.statusBar().showMessage(
+                    f"跳转到第 {i + 1} 张未标注图片", 2000
+                )
+                return
+        self.statusBar().showMessage("已全部标注完成 🎉", 3000)
+
+    # --- 关闭前未保存确认 ---
+
+    def closeEvent(self, event):
+        """关闭前如果当前图片未保存，弹窗询问。"""
+        if self._current_annotation is not None and self._current_annotation.modified:
+            name = Path(self._current_annotation.image_path).name
+            choice = QMessageBox.question(
+                self,
+                "未保存的修改",
+                f"图片 {name} 有未保存的修改，是否保存？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if choice == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if choice == QMessageBox.Save:
+                if not self._output_dir:
+                    QMessageBox.warning(
+                        self, "无法保存",
+                        "尚未设置输出目录，请先设置后再关闭。"
+                    )
+                    event.ignore()
+                    return
+                self._save_current(silent=True)
+        # 最后再 flush 一次 cache（确保 last_image_path 落盘）
+        if self._progress_cache_path:
+            self._converter.save_progress_cache(self._progress_cache_path, self._cache)
+        super().closeEvent(event)

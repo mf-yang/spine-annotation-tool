@@ -59,11 +59,23 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
             return
 
         color = self._get_color()
-        pen = QPen(color, 2)
+        pen = self._build_pen(color, width=2)
         self.setPen(pen)
         self.setBrush(QBrush(QColor(0, 0, 0, 0)))
         # Restore Z-value based on class (not selection)
         self._apply_z_value()
+
+    def _build_pen(self, color: QColor, width: int) -> QPen:
+        """根据 keypoint_visibility 决定线型：v=2 实线，v=1 短虚线，v=0 长虚线。"""
+        pen = QPen(color, width)
+        v = int(getattr(self.annotation, "keypoint_visibility", 2))
+        if v == 1:
+            pen.setStyle(Qt.DashLine)
+        elif v == 0:
+            pen.setStyle(Qt.DashDotLine)
+        else:
+            pen.setStyle(Qt.SolidLine)
+        return pen
 
     def _get_color(self):
         """Get color based on annotation class."""
@@ -84,7 +96,7 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         """Update visual state when selected."""
         self._selected = selected
         if selected:
-            pen = QPen(SELECTED_COLOR, 3)
+            pen = self._build_pen(SELECTED_COLOR, width=3)
             self.setPen(pen)
             area = max(self.annotation.width * self.annotation.height, 1)
             inv_area = 1.0 / area
@@ -94,7 +106,7 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
                 self.setZValue(10 + inv_area * 0.1)
         else:
             color = self._get_color()
-            pen = QPen(color, 2)
+            pen = self._build_pen(color, width=2)
             self.setPen(pen)
             self._apply_z_value()
         self.update()
@@ -142,6 +154,10 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         """Draw class name label above the box."""
         p0 = self.annotation.points[0]
         label = f"{self.annotation.class_name} ({math.degrees(self.annotation.angle):.1f}°)"
+        v = int(getattr(self.annotation, "keypoint_visibility", 2))
+        if v != 2:
+            v_text = {1: "遮挡", 0: "不可见"}.get(v, "")
+            label += f" [v={v} {v_text}]"
 
         painter.setPen(QPen(SELECTED_COLOR))
         painter.setFont(QFont("Arial", 10, QFont.Bold))

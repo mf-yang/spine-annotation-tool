@@ -122,11 +122,18 @@ class YOLOConverter:
 
         return result
 
+    # cache 中存放元信息（如 last_image_path）的特殊 key，
+    # 以双下划线包围避免与真实图片路径冲突
+    META_KEY = "__meta__"
+
     def load_single(self, image_path: str, label_path: Optional[str],
                     img_w: int, img_h: int,
                     cache_entry: Optional[dict] = None) -> ImageAnnotation:
-        """Load annotations for a single image on demand."""
-        del cache_entry  # 保留参数以兼容旧调用，不再使用 cache 状态
+        """Load annotations for a single image on demand.
+
+        Args:
+            cache_entry: 可选，用于从缓存恢复每个标注的 keypoint_visibility 等状态
+        """
         annotation = ImageAnnotation(
             image_path=image_path,
             image_width=img_w,
@@ -137,6 +144,15 @@ class YOLOConverter:
             annotation.annotations = self._load_labels(
                 Path(label_path), img_w, img_h
             )
+
+            # 从 cache 恢复 keypoint_visibility（按索引一一对应）
+            if cache_entry and "annotation_states" in cache_entry:
+                states = cache_entry["annotation_states"]
+                for i, ann in enumerate(annotation.annotations):
+                    if i < len(states):
+                        ann.keypoint_visibility = int(
+                            states[i].get("keypoint_visibility", 2)
+                        )
 
         return annotation
 
@@ -153,6 +169,25 @@ class YOLOConverter:
             return {}
         with open(cache_path, "r") as f:
             return json.load(f)
+
+    # --- cache 元信息 helpers ---
+
+    def get_last_image_path(self, cache: dict) -> Optional[str]:
+        """读取上次编辑的图片路径（用于启动时智能跳转）。"""
+        meta = cache.get(self.META_KEY, {})
+        return meta.get("last_image_path")
+
+    def set_last_image_path(self, cache: dict, image_path: str) -> None:
+        """记录当前正在编辑的图片路径到 cache（不写盘，调用方负责落盘）。"""
+        meta = cache.setdefault(self.META_KEY, {})
+        meta["last_image_path"] = image_path
+
+    def build_annotation_states(self, annotation: ImageAnnotation) -> list:
+        """从 ImageAnnotation 提取每个标注的可序列化状态，用于写入 cache。"""
+        return [
+            {"keypoint_visibility": int(ann.keypoint_visibility)}
+            for ann in annotation.annotations
+        ]
 
     def _load_labels(self, label_path: Path,
                      img_w: int, img_h: int) -> List[OBBAnnotation]:
@@ -252,8 +287,7 @@ class YOLOConverter:
         return True
 
     def save_pose_yolov8(self, annotation: ImageAnnotation,
-                        output_dir: str, overwrite: bool = False,
-                        visibility: int = 2):
+                        output_dir: str, overwrite: bool = False):
         """Save annotations in YOLOv8-pose format.
 
         Format per line (all normalized to [0, 1]):
@@ -262,7 +296,8 @@ class YOLOConverter:
         - bbox(cx, cy, w, h): 包围 OBB 四个角点的 AABB
         - keypoints: 椎骨矩形的 4 个角点，顺时针排列
             x1,y1 = 左上, x2,y2 = 右上, x3,y3 = 右下, x4,y4 = 左下
-        - v: 可见性 (0=不可见, 1=遮挡, 2=可见)，默认全部为 2
+        - v: 可见性 (0=不可见, 1=遮挡, 2=可见)
+          取自 OBBAnnotation.keypoint_visibility（对该标注 4 个点统一生效），默认 2
         """
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)
@@ -289,6 +324,8 @@ class YOLOConverter:
                 bbox_cx = x_min + bbox_w / 2
                 bbox_cy = y_min + bbox_h / 2
 
+                v = int(ann.keypoint_visibility)
+
                 parts = [
                     str(ann.class_id),
                     f"{bbox_cx / w_img:.6f}",
@@ -302,7 +339,7 @@ class YOLOConverter:
                 for p in ann.points:
                     parts.append(f"{p.x / w_img:.6f}")
                     parts.append(f"{p.y / h_img:.6f}")
-                    parts.append(str(visibility))
+                    parts.append(str(v))
 
                 f.write(" ".join(parts) + "\n")
 

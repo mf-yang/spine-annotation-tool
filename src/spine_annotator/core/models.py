@@ -34,8 +34,14 @@ class OBBAnnotation:
     width: float = field(init=False)
     height: float = field(init=False)
 
-    # Visibility (layer control)
+    # Visibility (layer control: 是否在画布上显示)
     visible: bool = True
+
+    # 关键点可见性等级（YOLOv8-pose v 字段，对该标注的 4 个角点统一生效）
+    #   2 = 可见（默认）
+    #   1 = 遮挡（点存在但被遮挡，坐标仍有效）
+    #   0 = 不可见 / 推断（图像中肉眼无法看清，根据相邻椎骨推断）
+    keypoint_visibility: int = 2
 
     def __post_init__(self):
         self._update_geometry()
