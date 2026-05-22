@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QShortcut,
-    QStatusBar, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 from ..core.converter import YOLOConverter
@@ -110,6 +110,7 @@ class MainWindow(QMainWindow):
         self._format_combo.addItems([
             "YOLOv8-OBB (四角点)",
             "YOLOv8-OBB (xywhr)",
+            "YOLOv8-pose (bbox + 4 关键点)",
         ])
         self._format_combo.currentIndexChanged.connect(self._on_format_changed)
         right_layout.addWidget(self._format_combo)
@@ -183,38 +184,6 @@ class MainWindow(QMainWindow):
         angle_row.addWidget(self._btn_set_angle)
         right_layout.addLayout(angle_row)
 
-        right_layout.addSpacing(12)
-
-        # End vertebra markers
-        right_layout.addWidget(self._create_section_label("端椎标记"))
-        
-        # 上端椎
-        upper_layout = QHBoxLayout()
-        self._chk_upper_end = QCheckBox("上端椎")
-        self._chk_upper_end.stateChanged.connect(self._on_end_vertebra_changed)
-        upper_layout.addWidget(self._chk_upper_end)
-        
-        # Tooltip button
-        btn_tip_upper = QPushButton("?")
-        btn_tip_upper.setFixedSize(20, 20)
-        btn_tip_upper.setStyleSheet("font-weight: bold; color: #666;")
-        btn_tip_upper.setToolTip("上端椎：脊柱侧弯弯曲开始处的第一个椎骨，其上终板用于测量Cobb角")
-        upper_layout.addWidget(btn_tip_upper)
-        right_layout.addLayout(upper_layout)
-        
-        # 下端椎
-        lower_layout = QHBoxLayout()
-        self._chk_lower_end = QCheckBox("下端椎")
-        self._chk_lower_end.stateChanged.connect(self._on_end_vertebra_changed)
-        lower_layout.addWidget(self._chk_lower_end)
-        
-        btn_tip_lower = QPushButton("?")
-        btn_tip_lower.setFixedSize(20, 20)
-        btn_tip_lower.setStyleSheet("font-weight: bold; color: #666;")
-        btn_tip_lower.setToolTip("下端椎：脊柱侧弯弯曲结束处的最后一个椎骨，其下终板用于测量Cobb角")
-        lower_layout.addWidget(btn_tip_lower)
-        right_layout.addLayout(lower_layout)
-
         # Navigation
         right_layout.addSpacing(16)
         right_layout.addWidget(self._create_section_label("导航"))
@@ -246,8 +215,7 @@ class MainWindow(QMainWindow):
         # Color legend
         right_layout.addSpacing(8)
         color_legend = QLabel(
-            "■ 绿色: 椎骨 | ■ 青色: 上端椎\n"
-            "■ 紫色: 下端椎 | ■ 红/蓝: 脊柱"
+            "■ 绿色: 椎骨 | ■ 红/蓝: 脊柱"
         )
         color_legend.setStyleSheet("color: #666; font-size: 11px;")
         color_legend.setWordWrap(True)
@@ -370,7 +338,12 @@ class MainWindow(QMainWindow):
             self._btn_save.setEnabled(True)
 
     def _on_format_changed(self, index: int):
-        self._export_format = "yolov8_obb" if index == 0 else "yolov8_xywhr"
+        if index == 0:
+            self._export_format = "yolov8_obb"
+        elif index == 1:
+            self._export_format = "yolov8_xywhr"
+        else:
+            self._export_format = "yolov8_pose"
 
     # --- Navigation ---
 
@@ -441,13 +414,6 @@ class MainWindow(QMainWindow):
         """Update info panel when selection changes."""
         if index < 0 or not self._current_annotation:
             self._ann_info_label.setText("无选中")
-            # Reset end vertebra checkboxes
-            self._chk_upper_end.blockSignals(True)
-            self._chk_upper_end.setChecked(False)
-            self._chk_upper_end.blockSignals(False)
-            self._chk_lower_end.blockSignals(True)
-            self._chk_lower_end.setChecked(False)
-            self._chk_lower_end.blockSignals(False)
             return
 
         # Map scene index to original annotation index
@@ -469,14 +435,6 @@ class MainWindow(QMainWindow):
             self._angle_spin.blockSignals(True)
             self._angle_spin.setValue(angle_deg)
             self._angle_spin.blockSignals(False)
-
-            # Update end vertebra checkboxes
-            self._chk_upper_end.blockSignals(True)
-            self._chk_upper_end.setChecked(ann.is_upper_end)
-            self._chk_upper_end.blockSignals(False)
-            self._chk_lower_end.blockSignals(True)
-            self._chk_lower_end.setChecked(ann.is_lower_end)
-            self._chk_lower_end.blockSignals(False)
 
     def _on_annotation_modified(self):
         """Mark current image as modified."""
@@ -504,20 +462,6 @@ class MainWindow(QMainWindow):
         # Update canvas items
         for item in self._canvas._obb_items:
             item.setVisible(item.annotation.visible)
-
-    def _on_end_vertebra_changed(self):
-        """Handle end vertebra checkbox changes."""
-        ann = self._canvas.get_selected_annotation()
-        if ann is None:
-            return
-        ann.is_upper_end = self._chk_upper_end.isChecked()
-        ann.is_lower_end = self._chk_lower_end.isChecked()
-        if self._current_annotation:
-            self._current_annotation.modified = True
-        # Refresh canvas to show/hide markers
-        if 0 <= self._canvas._current_selection < len(self._canvas._obb_items):
-            self._canvas._obb_items[self._canvas._current_selection].update()
-        self._canvas.viewport().update()
 
     def _on_angle_spin_changed(self, value: float):
         """Called when angle spinbox value changes (but not applied yet)."""
@@ -562,21 +506,16 @@ class MainWindow(QMainWindow):
 
         if self._export_format == "yolov8_obb":
             self._converter.save_obb_yolov8(self._current_annotation, out_dir, overwrite=True)
-        else:
+        elif self._export_format == "yolov8_xywhr":
             self._converter.save_obb_xywhr(self._current_annotation, out_dir, overwrite=True)
+        else:  # yolov8_pose
+            self._converter.save_pose_yolov8(self._current_annotation, out_dir, overwrite=True)
 
-        # Update cache with end vertebra state
+        # Update cache
         img_path = info["image_path"]
-        ann_states = []
-        for ann in self._current_annotation.annotations:
-            ann_states.append({
-                "is_upper_end": ann.is_upper_end,
-                "is_lower_end": ann.is_lower_end,
-            })
         self._cache[img_path] = {
             "modified": False,
             "saved": True,
-            "annotation_states": ann_states,
         }
         self._current_annotation.modified = False
 
@@ -619,8 +558,10 @@ class MainWindow(QMainWindow):
 
                 if self._export_format == "yolov8_obb":
                     self._converter.save_obb_yolov8(ann, out_dir, overwrite=True)
-                else:
+                elif self._export_format == "yolov8_xywhr":
                     self._converter.save_obb_xywhr(ann, out_dir, overwrite=True)
+                else:  # yolov8_pose
+                    self._converter.save_pose_yolov8(ann, out_dir, overwrite=True)
 
                 self._cache[img_path] = {"modified": False, "saved": True}
                 count += 1

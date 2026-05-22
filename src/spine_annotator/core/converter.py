@@ -16,8 +16,6 @@ class YOLOConverter:
             0: "Vertebra",
             1: "scoliosis spine",
             2: "normal spine",
-            3: "upper_end_vertebra",  # 上端椎
-            4: "lower_end_vertebra",  # 下端椎
         }
 
     def validate_dataset(self, dataset_root: str) -> Tuple[bool, str]:
@@ -125,12 +123,10 @@ class YOLOConverter:
         return result
 
     def load_single(self, image_path: str, label_path: Optional[str],
-                    img_w: int, img_h: int, cache_entry: Optional[dict] = None) -> ImageAnnotation:
-        """Load annotations for a single image on demand.
-        
-        Args:
-            cache_entry: Optional cache entry to restore end vertebra markers
-        """
+                    img_w: int, img_h: int,
+                    cache_entry: Optional[dict] = None) -> ImageAnnotation:
+        """Load annotations for a single image on demand."""
+        del cache_entry  # 保留参数以兼容旧调用，不再使用 cache 状态
         annotation = ImageAnnotation(
             image_path=image_path,
             image_width=img_w,
@@ -141,19 +137,11 @@ class YOLOConverter:
             annotation.annotations = self._load_labels(
                 Path(label_path), img_w, img_h
             )
-            
-            # Restore end vertebra markers from cache
-            if cache_entry and "annotation_states" in cache_entry:
-                states = cache_entry["annotation_states"]
-                for i, ann in enumerate(annotation.annotations):
-                    if i < len(states):
-                        ann.is_upper_end = states[i].get("is_upper_end", False)
-                        ann.is_lower_end = states[i].get("is_lower_end", False)
 
         return annotation
 
     def save_progress_cache(self, cache_path: str, progress: dict):
-        """Save progress cache to JSON file (includes end vertebra markers)."""
+        """Save progress cache to JSON file."""
         import json
         with open(cache_path, "w") as f:
             json.dump(progress, f, indent=2)
@@ -165,21 +153,6 @@ class YOLOConverter:
             return {}
         with open(cache_path, "r") as f:
             return json.load(f)
-
-    def save_annotation_state(self, annotation: ImageAnnotation, cache: dict):
-        """Save annotation state including end vertebra markers to cache."""
-        img_path = annotation.image_path
-        ann_states = []
-        for ann in annotation.annotations:
-            ann_states.append({
-                "is_upper_end": ann.is_upper_end,
-                "is_lower_end": ann.is_lower_end,
-            })
-        cache[img_path] = {
-            "saved": True,
-            "modified": annotation.modified,
-            "annotation_states": ann_states,
-        }
 
     def _load_labels(self, label_path: Path,
                      img_w: int, img_h: int) -> List[OBBAnnotation]:
@@ -231,21 +204,13 @@ class YOLOConverter:
 
         with open(label_path, "w") as f:
             for ann in annotation.annotations:
-                # Determine effective class_id: end vertebra markers override class
-                eff_class = ann.class_id
-                if ann.class_id == 0:  # Only vertebrae can be end vertebrae
-                    if ann.is_upper_end:
-                        eff_class = 3  # upper_end_vertebra
-                    elif ann.is_lower_end:
-                        eff_class = 4  # lower_end_vertebra
-
                 # 4 corner points, normalized
                 coords = []
                 for p in ann.points:
                     coords.append(f"{p.x / w_img:.6f}")
                     coords.append(f"{p.y / h_img:.6f}")
 
-                line = f"{eff_class} {' '.join(coords)}\n"
+                line = f"{ann.class_id} {' '.join(coords)}\n"
                 f.write(line)
 
         return True
@@ -271,26 +236,75 @@ class YOLOConverter:
 
         with open(label_path, "w") as f:
             for ann in annotation.annotations:
-                # Determine effective class_id
-                eff_class = ann.class_id
-                if ann.class_id == 0:
-                    if ann.is_upper_end:
-                        eff_class = 3
-                    elif ann.is_lower_end:
-                        eff_class = 4
-
                 cx, cy, w, h, angle = ann.to_xywhr()
 
                 # Normalize angle to [-pi/4, pi/4)
                 angle = self._normalize_angle(angle)
 
                 line = (
-                    f"{eff_class} "
+                    f"{ann.class_id} "
                     f"{cx / w_img:.6f} {cy / h_img:.6f} "
                     f"{w / w_img:.6f} {h / h_img:.6f} "
                     f"{angle:.6f}\n"
                 )
                 f.write(line)
+
+        return True
+
+    def save_pose_yolov8(self, annotation: ImageAnnotation,
+                        output_dir: str, overwrite: bool = False,
+                        visibility: int = 2):
+        """Save annotations in YOLOv8-pose format.
+
+        Format per line (all normalized to [0, 1]):
+            class_id  cx cy w h  x1 y1 v1  x2 y2 v2  x3 y3 v3  x4 y4 v4
+
+        - bbox(cx, cy, w, h): 包围 OBB 四个角点的 AABB
+        - keypoints: 椎骨矩形的 4 个角点，顺时针排列
+            x1,y1 = 左上, x2,y2 = 右上, x3,y3 = 右下, x4,y4 = 左下
+        - v: 可见性 (0=不可见, 1=遮挡, 2=可见)，默认全部为 2
+        """
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        img_path = Path(annotation.image_path)
+        label_name = img_path.stem + ".txt"
+        label_path = output / label_name
+
+        if label_path.exists() and not overwrite:
+            return False
+
+        w_img = annotation.image_width
+        h_img = annotation.image_height
+
+        with open(label_path, "w") as f:
+            for ann in annotation.annotations:
+                xs = [p.x for p in ann.points]
+                ys = [p.y for p in ann.points]
+                x_min, x_max = min(xs), max(xs)
+                y_min, y_max = min(ys), max(ys)
+
+                bbox_w = x_max - x_min
+                bbox_h = y_max - y_min
+                bbox_cx = x_min + bbox_w / 2
+                bbox_cy = y_min + bbox_h / 2
+
+                parts = [
+                    str(ann.class_id),
+                    f"{bbox_cx / w_img:.6f}",
+                    f"{bbox_cy / h_img:.6f}",
+                    f"{bbox_w / w_img:.6f}",
+                    f"{bbox_h / h_img:.6f}",
+                ]
+
+                # Keypoints: 顺时针 左上, 右上, 右下, 左下
+                # OBBAnnotation.points 即按此顺序存储
+                for p in ann.points:
+                    parts.append(f"{p.x / w_img:.6f}")
+                    parts.append(f"{p.y / h_img:.6f}")
+                    parts.append(str(visibility))
+
+                f.write(" ".join(parts) + "\n")
 
         return True
 

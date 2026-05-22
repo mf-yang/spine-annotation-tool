@@ -22,10 +22,6 @@ CLASS_COLORS = [
     QColor(0, 100, 255, 180),  # blue - normal spine
 ]
 
-# End vertebra colors
-UPPER_END_COLOR = QColor(0, 255, 255, 220)   # cyan - 上端椎
-LOWER_END_COLOR = QColor(255, 0, 255, 220)   # magenta - 下端椎
-
 SELECTED_COLOR = QColor(255, 255, 0, 220)  # yellow
 HANDLE_SIZE = 6  # corner handle radius in pixels
 ROTATE_HANDLE_OFFSET = 25  # distance of rotation handle from box
@@ -70,12 +66,7 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         self._apply_z_value()
 
     def _get_color(self):
-        """Get color based on annotation type and end vertebra markers."""
-        if self.annotation.class_id == 0:
-            if self.annotation.is_upper_end:
-                return UPPER_END_COLOR
-            elif self.annotation.is_lower_end:
-                return LOWER_END_COLOR
+        """Get color based on annotation class."""
         return CLASS_COLORS[self.annotation.class_id % len(CLASS_COLORS)]
 
     def _apply_z_value(self):
@@ -151,16 +142,7 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         """Draw class name label above the box."""
         p0 = self.annotation.points[0]
         label = f"{self.annotation.class_name} ({math.degrees(self.annotation.angle):.1f}°)"
-        
-        # Add end vertebra markers
-        markers = []
-        if self.annotation.is_upper_end:
-            markers.append("上端椎")
-        if self.annotation.is_lower_end:
-            markers.append("下端椎")
-        if markers:
-            label += f" [{', '.join(markers)}]"
-        
+
         painter.setPen(QPen(SELECTED_COLOR))
         painter.setFont(QFont("Arial", 10, QFont.Bold))
         painter.drawText(QPointF(p0.x, p0.y - 8), label)
