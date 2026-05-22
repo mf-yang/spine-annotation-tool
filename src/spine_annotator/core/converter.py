@@ -20,6 +20,64 @@ class YOLOConverter:
             4: "lower_end_vertebra",  # 下端椎
         }
 
+    def validate_dataset(self, dataset_root: str) -> Tuple[bool, str]:
+        """Validate if directory is a valid YOLO dataset.
+        
+        Returns: (is_valid, message)
+        """
+        root = Path(dataset_root)
+        if not root.exists():
+            return False, f"目录不存在: {dataset_root}"
+        if not root.is_dir():
+            return False, f"不是目录: {dataset_root}"
+
+        splits = ["train", "valid", "test"]
+        is_root = any((root / s / "images").exists() for s in splits)
+
+        if is_root:
+            found = []
+            for s in splits:
+                img_dir = root / s / "images"
+                if img_dir.exists():
+                    count = len(list(img_dir.glob("*.jpg"))) + len(list(img_dir.glob("*.png")))
+                    found.append(f"{s}: {count} 张")
+            if not found:
+                return False, "在 train/valid/test 目录下未找到图片（支持 .jpg/.png）"
+            return True, f"检测到数据集结构: {', '.join(found)}"
+        else:
+            # Check if it's a single split directory
+            img_dir = root / "images"
+            if img_dir.exists():
+                count = len(list(img_dir.glob("*.jpg"))) + len(list(img_dir.glob("*.png")))
+                if count > 0:
+                    return True, f"检测到单分片目录，包含 {count} 张图片"
+            # Check if images are directly in this dir
+            jpg_count = len(list(root.glob("*.jpg")))
+            png_count = len(list(root.glob("*.png")))
+            if jpg_count + png_count > 0:
+                return False, (
+                    f"目录中有 {jpg_count + png_count} 张图片，但不符合 YOLO 数据集格式。\n\n"
+                    "期望格式：\n"
+                    "  根目录/\n"
+                    "    train/images/ + train/labels/\n"
+                    "    valid/images/ + valid/labels/\n"
+                    "    test/images/ + test/labels/\n\n"
+                    "或者单分片：\n"
+                    "  目录/\n"
+                    "    images/\n"
+                    "    labels/"
+                )
+            return False, (
+                "不是有效的 YOLO 数据集目录。\n\n"
+                "期望格式：\n"
+                "  根目录/\n"
+                "    train/images/ + train/labels/\n"
+                "    valid/images/ + valid/labels/\n"
+                "    test/images/ + test/labels/\n\n"
+                "或者单分片：\n"
+                "  目录/images/ + 目录/labels/"
+            )
+
     def scan_dataset(self, dataset_root: str) -> List[dict]:
         """Scan dataset and return list of image info (without loading pixels).
         
@@ -34,12 +92,12 @@ class YOLOConverter:
         is_root = any((root / s / "images").exists() for s in splits)
 
         if is_root:
-            scan_dirs = [(root / s / "images", root / s / "labels") for s in splits]
+            scan_dirs = [(root / s / "images", root / s / "labels", s) for s in splits]
         else:
             # Assume selected dir is already a split directory
-            scan_dirs = [(root / "images", root / "labels")]
+            scan_dirs = [(root / "images", root / "labels", root.name)]
 
-        for images_dir, labels_dir in scan_dirs:
+        for images_dir, labels_dir, split_name in scan_dirs:
             if not images_dir.exists():
                 continue
 
@@ -61,6 +119,7 @@ class YOLOConverter:
                     "width": w_img,
                     "height": h_img,
                     "has_labels": label_path.exists(),
+                    "split": split_name,
                 })
 
         return result

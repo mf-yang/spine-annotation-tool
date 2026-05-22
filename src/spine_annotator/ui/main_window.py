@@ -321,9 +321,15 @@ class MainWindow(QMainWindow):
         if not dir_path:
             return
 
+        # Validate dataset format
+        is_valid, message = self._converter.validate_dataset(dir_path)
+        if not is_valid:
+            QMessageBox.warning(self, "数据集格式错误", message)
+            return
+
         self._dataset_root = dir_path
         self._progress_cache_path = os.path.join(dir_path, ".annotate_progress.json")
-        self._dataset_path_label.setText(dir_path)
+        self._dataset_path_label.setText(f"{dir_path}\n{message}")
         self.statusBar().showMessage("正在扫描数据集...")
 
         # Scan images (fast, no pixel loading)
@@ -336,7 +342,9 @@ class MainWindow(QMainWindow):
         self._image_list_widget.clear()
         for info in self._image_infos:
             name = Path(info["image_path"]).stem
-            item = QListWidgetItem(name)
+            split = info.get("split", "")
+            display = f"[{split}] {name}" if split else name
+            item = QListWidgetItem(display)
             # Mark if already processed
             if self._cache.get(info["image_path"], {}).get("saved"):
                 item.setForeground(Qt.gray)
@@ -545,10 +553,17 @@ class MainWindow(QMainWindow):
 
         info = self._image_infos[self._current_index]
 
-        if self._export_format == "yolov8_obb":
-            self._converter.save_obb_yolov8(self._current_annotation, self._output_dir, overwrite=True)
+        # Compute split-aware output directory
+        split = info.get("split", "")
+        if split:
+            out_dir = os.path.join(self._output_dir, split, "labels")
         else:
-            self._converter.save_obb_xywhr(self._current_annotation, self._output_dir, overwrite=True)
+            out_dir = self._output_dir
+
+        if self._export_format == "yolov8_obb":
+            self._converter.save_obb_yolov8(self._current_annotation, out_dir, overwrite=True)
+        else:
+            self._converter.save_obb_xywhr(self._current_annotation, out_dir, overwrite=True)
 
         # Update cache with end vertebra state
         img_path = info["image_path"]
@@ -595,10 +610,17 @@ class MainWindow(QMainWindow):
                 else:
                     ann = self._current_annotation
 
-                if self._export_format == "yolov8_obb":
-                    self._converter.save_obb_yolov8(ann, self._output_dir, overwrite=True)
+                # Compute split-aware output directory
+                split = info.get("split", "")
+                if split:
+                    out_dir = os.path.join(self._output_dir, split, "labels")
                 else:
-                    self._converter.save_obb_xywhr(ann, self._output_dir, overwrite=True)
+                    out_dir = self._output_dir
+
+                if self._export_format == "yolov8_obb":
+                    self._converter.save_obb_yolov8(ann, out_dir, overwrite=True)
+                else:
+                    self._converter.save_obb_xywhr(ann, out_dir, overwrite=True)
 
                 self._cache[img_path] = {"modified": False, "saved": True}
                 count += 1
