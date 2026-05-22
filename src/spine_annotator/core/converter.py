@@ -131,8 +131,13 @@ class YOLOConverter:
                     cache_entry: Optional[dict] = None) -> ImageAnnotation:
         """Load annotations for a single image on demand.
 
+        加载优先级：
+        1. 若 cache_entry 中含有完整 `points`（OBB 四角点像素坐标），
+           使用 cache 的几何状态重建（保留之前的旋转/移动/可见性编辑）
+        2. 否则从原始 YOLO label 文件读 AABB（水平矩形）
+
         Args:
-            cache_entry: 可选，用于从缓存恢复每个标注的 keypoint_visibility 等状态
+            cache_entry: 可选，用于从缓存恢复每个标注的 OBB 几何与可见性
         """
         annotation = ImageAnnotation(
             image_path=image_path,
@@ -145,14 +150,26 @@ class YOLOConverter:
                 Path(label_path), img_w, img_h
             )
 
-            # 从 cache 恢复 keypoint_visibility（按索引一一对应）
+            # 从 cache 恢复编辑后的 OBB 几何 + keypoint_visibility
+            # （按索引一一对应；如果索引超出范围则保留原 AABB 几何）
             if cache_entry and "annotation_states" in cache_entry:
                 states = cache_entry["annotation_states"]
                 for i, ann in enumerate(annotation.annotations):
-                    if i < len(states):
-                        ann.keypoint_visibility = int(
-                            states[i].get("keypoint_visibility", 2)
-                        )
+                    if i >= len(states):
+                        continue
+                    state = states[i]
+                    # 恢复几何（如果 cache 中有完整 4 点坐标）
+                    pts = state.get("points")
+                    if (
+                        isinstance(pts, list) and len(pts) == 4
+                        and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts)
+                    ):
+                        ann.points = [Point(float(p[0]), float(p[1])) for p in pts]
+                        ann._update_geometry()
+                    # 恢复可见性
+                    ann.keypoint_visibility = int(
+                        state.get("keypoint_visibility", 2)
+                    )
 
         return annotation
 
@@ -183,11 +200,19 @@ class YOLOConverter:
         meta["last_image_path"] = image_path
 
     def build_annotation_states(self, annotation: ImageAnnotation) -> list:
-        """从 ImageAnnotation 提取每个标注的可序列化状态，用于写入 cache。"""
-        return [
-            {"keypoint_visibility": int(ann.keypoint_visibility)}
-            for ann in annotation.annotations
-        ]
+        """从 ImageAnnotation 提取每个标注的可序列化状态，用于写入 cache。
+
+        保存的状态：
+          - points: 4 个角点的像素坐标 [[x, y], ...]，保留旋转/移动/角点拖拽编辑结果
+          - keypoint_visibility: YOLOv8-pose v 字段
+        """
+        states = []
+        for ann in annotation.annotations:
+            states.append({
+                "points": [[round(p.x, 3), round(p.y, 3)] for p in ann.points],
+                "keypoint_visibility": int(ann.keypoint_visibility),
+            })
+        return states
 
     def _load_labels(self, label_path: Path,
                      img_w: int, img_h: int) -> List[OBBAnnotation]:

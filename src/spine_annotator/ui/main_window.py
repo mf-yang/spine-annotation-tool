@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSettings, QTimer
 from PyQt5.QtGui import QBrush, QColor, QKeySequence
 from PyQt5.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
@@ -22,10 +22,18 @@ from .image_canvas import AnnotationCanvas
 class MainWindow(QMainWindow):
     """Main application window."""
 
+    # QSettings 的 key 常量
+    SETTINGS_LAST_DATASET = "last_dataset_dir"
+    SETTINGS_LAST_OUTPUT = "last_output_dir"
+    SETTINGS_LAST_FORMAT = "last_export_format"  # 字符串：yolov8_obb / yolov8_xywhr / yolov8_pose
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("脊柱椎骨标注工具 - Spine Annotator")
         self.resize(1400, 900)
+
+        # 持久化设置（macOS 写到 ~/Library/Preferences、Linux 写 INI、Windows 写注册表）
+        self._settings = QSettings("spine-annotator", "spine-annotator")
 
         # Data
         self._converter = YOLOConverter()
@@ -47,6 +55,9 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._init_shortcuts()
         self._init_statusbar()
+
+        # 启动后异步恢复上次会话（让窗口先显示出来，避免大数据集扫描时白屏）
+        QTimer.singleShot(0, self._restore_last_session)
 
     def _init_ui(self):
         """Initialize the UI layout."""
@@ -310,19 +321,28 @@ class MainWindow(QMainWindow):
     # --- Dataset Operations ---
 
     def _open_dataset(self):
-        """Open a YOLOv5/v8 dataset directory (scan only, no pixel loading)."""
+        """用户主动选择 YOLOv5/v8 数据集目录。"""
         dir_path = QFileDialog.getExistingDirectory(
             self, "选择 YOLO 数据集目录",
-            str(Path.home()),
+            self._settings.value(self.SETTINGS_LAST_DATASET, str(Path.home())),
         )
         if not dir_path:
             return
+        self._load_dataset(dir_path)
 
-        # Validate dataset format
+    def _load_dataset(self, dir_path: str, *, silent_invalid: bool = False) -> bool:
+        """加载指定路径的 YOLO 数据集（共用：用户主动打开 & 启动自动恢复）。
+
+        Args:
+            silent_invalid: True 时，校验失败不弹窗（用于启动恢复，避免打扰）
+        Returns:
+            是否加载成功
+        """
         is_valid, message = self._converter.validate_dataset(dir_path)
         if not is_valid:
-            QMessageBox.warning(self, "数据集格式错误", message)
-            return
+            if not silent_invalid:
+                QMessageBox.warning(self, "数据集格式错误", message)
+            return False
 
         self._dataset_root = dir_path
         self._progress_cache_path = os.path.join(dir_path, ".annotate_progress.json")
@@ -351,10 +371,41 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已扫描 {len(self._image_infos)} 张图片")
         self._btn_save_all.setEnabled(True)
 
+        # 持久化数据集目录
+        self._settings.setValue(self.SETTINGS_LAST_DATASET, dir_path)
+
         # 智能跳转：1) 优先恢复 last_image_path  2) 否则跳到第一张未标注
         target_index = self._resolve_initial_index()
         if target_index >= 0:
             self._go_to_image(target_index)
+        return True
+
+    def _restore_last_session(self):
+        """启动后自动恢复上次的数据集 + 输出目录 + 导出格式。"""
+        # 1) 导出格式（无 IO，最先恢复）
+        last_fmt = self._settings.value(self.SETTINGS_LAST_FORMAT, "")
+        if last_fmt in ("yolov8_obb", "yolov8_xywhr", "yolov8_pose"):
+            self._export_format = last_fmt
+            fmt_index = {"yolov8_obb": 0, "yolov8_xywhr": 1, "yolov8_pose": 2}[last_fmt]
+            self._format_combo.blockSignals(True)
+            self._format_combo.setCurrentIndex(fmt_index)
+            self._format_combo.blockSignals(False)
+
+        # 2) 输出目录（先于数据集恢复，确保保存功能可用）
+        last_output = self._settings.value(self.SETTINGS_LAST_OUTPUT, "")
+        if last_output and Path(last_output).is_dir():
+            self._output_dir = last_output
+            self._output_path_label.setText(last_output)
+            self._btn_save.setEnabled(True)
+
+        # 3) 数据集目录（异步加载）
+        last_dataset = self._settings.value(self.SETTINGS_LAST_DATASET, "")
+        if last_dataset and Path(last_dataset).is_dir():
+            ok = self._load_dataset(last_dataset, silent_invalid=True)
+            if ok:
+                self.statusBar().showMessage(
+                    f"已自动恢复上次会话：{Path(last_dataset).name}", 4000
+                )
 
     def _resolve_initial_index(self) -> int:
         """决定打开数据集后应该跳转到哪张图片。
@@ -394,13 +445,15 @@ class MainWindow(QMainWindow):
 
     def _set_output_dir(self):
         """Set the output directory for exported annotations."""
+        start_dir = self._settings.value(self.SETTINGS_LAST_OUTPUT, str(Path.home()))
         dir_path = QFileDialog.getExistingDirectory(
-            self, "选择输出目录", str(Path.home()),
+            self, "选择输出目录", start_dir,
         )
         if dir_path:
             self._output_dir = dir_path
             self._output_path_label.setText(dir_path)
             self._btn_save.setEnabled(True)
+            self._settings.setValue(self.SETTINGS_LAST_OUTPUT, dir_path)
 
     def _on_format_changed(self, index: int):
         if index == 0:
@@ -409,6 +462,7 @@ class MainWindow(QMainWindow):
             self._export_format = "yolov8_xywhr"
         else:
             self._export_format = "yolov8_pose"
+        self._settings.setValue(self.SETTINGS_LAST_FORMAT, self._export_format)
 
     # --- Navigation ---
 
@@ -417,9 +471,14 @@ class MainWindow(QMainWindow):
         if not (0 <= index < len(self._image_infos)):
             return
 
-        # Auto-save previous if modified
+        # 切换前持久化当前张：
+        #   - 已设置 output_dir：正常保存（写 labels 文件 + cache）
+        #   - 未设置 output_dir：仍把 OBB 几何状态记入 cache，避免丢失编辑
         if self._current_index >= 0 and self._current_annotation and self._current_annotation.modified:
-            self._save_current(silent=True)
+            if self._output_dir:
+                self._save_current(silent=True)
+            else:
+                self._checkpoint_geometry_to_cache()
 
         prev_index = self._current_index
         self._current_index = index
@@ -651,6 +710,29 @@ class MainWindow(QMainWindow):
 
         if not silent:
             self.statusBar().showMessage(f"已保存: {Path(img_path).name}")
+
+    def _checkpoint_geometry_to_cache(self):
+        """把当前张 OBB 几何写入 cache（不算正式保存，仅防止编辑丢失）。
+
+        触发场景：用户尚未设置输出目录但已经在编辑，切图时调用本方法
+        把几何状态持久化到 .annotate_progress.json，下次回到该图能恢复编辑。
+        """
+        if not (self._current_annotation and self._progress_cache_path):
+            return
+        info = self._image_infos[self._current_index]
+        img_path = info["image_path"]
+        existing = self._cache.get(img_path, {})
+        existing.update({
+            # 注意：不改 saved 字段（仍保持 false / 之前的值），仅记录几何
+            "annotation_states": self._converter.build_annotation_states(
+                self._current_annotation
+            ),
+        })
+        # 如果之前没有 saved 字段，确保至少有个 false
+        existing.setdefault("saved", False)
+        existing["modified"] = True
+        self._cache[img_path] = existing
+        self._converter.save_progress_cache(self._progress_cache_path, self._cache)
 
     def _save_all(self):
         """Export all images that have been processed."""
