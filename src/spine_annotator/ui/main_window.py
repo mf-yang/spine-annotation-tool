@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PyQt5.QtCore import Qt, QSettings, QTimer
-from PyQt5.QtGui import QBrush, QColor, QKeySequence
+from PyQt5.QtGui import QBrush, QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
@@ -102,7 +102,7 @@ class MainWindow(QMainWindow):
 
         self._dataset_path_label = QLabel("未加载")
         self._dataset_path_label.setWordWrap(True)
-        self._dataset_path_label.setStyleSheet("color: gray; font-size: 11px;")
+        self._dataset_path_label.setStyleSheet(self._muted_text_style(11))
         right_layout.addWidget(self._dataset_path_label)
 
         # Export controls
@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
 
         self._output_path_label = QLabel("未设置")
         self._output_path_label.setWordWrap(True)
-        self._output_path_label.setStyleSheet("color: gray; font-size: 11px;")
+        self._output_path_label.setStyleSheet(self._muted_text_style(11))
         right_layout.addWidget(self._output_path_label)
 
         self._format_combo = QComboBox()
@@ -240,7 +240,7 @@ class MainWindow(QMainWindow):
             "其他: F 适配 | Esc 取消\n"
             "      Ctrl+S 保存"
         )
-        shortcut_help.setStyleSheet("color: #666; font-size: 11px; line-height: 1.4;")
+        shortcut_help.setStyleSheet(self._muted_text_style(11) + " line-height: 1.4;")
         shortcut_help.setWordWrap(True)
         right_layout.addWidget(shortcut_help)
 
@@ -249,7 +249,7 @@ class MainWindow(QMainWindow):
         color_legend = QLabel(
             "■ 绿色: 椎骨 | ■ 红/蓝: 脊柱"
         )
-        color_legend.setStyleSheet("color: #666; font-size: 11px;")
+        color_legend.setStyleSheet(self._muted_text_style(11))
         color_legend.setWordWrap(True)
         right_layout.addWidget(color_legend)
 
@@ -263,11 +263,20 @@ class MainWindow(QMainWindow):
 
     def _create_section_label(self, text: str) -> QLabel:
         label = QLabel(text)
-        label.setStyleSheet(
-            "font-weight: bold; font-size: 13px; "
-            "padding: 4px 0; color: #333;"
-        )
+        # 不设 color，让 Qt 自动用主题默认文字色（深 / 浅模式都能看清）
+        # 仅用加粗 + 字号体现层次
+        label.setStyleSheet("font-weight: bold; font-size: 13px; padding: 4px 0;")
         return label
+
+    def _muted_text_style(self, font_size: int = 11) -> str:
+        """返回适合当前主题（深 / 浅）的"次要信息"文本样式。
+
+        深色模式：浅灰文字（#aaaaaa），在深色背景上清晰可读
+        浅色模式：深灰文字（#666666），传统次要信息观感
+        """
+        is_dark = self.palette().color(QPalette.Window).lightness() < 128
+        color = "#aaaaaa" if is_dark else "#666666"
+        return f"color: {color}; font-size: {font_size}px;"
 
     def _init_shortcuts(self):
         """Initialize keyboard shortcuts."""
@@ -823,10 +832,10 @@ class MainWindow(QMainWindow):
     def _apply_item_style(self, index: int):
         """更新单个列表项的颜色 + 加粗状态。
 
-        三态颜色：
-          - 已修改未保存：橙色（最显眼，提醒用户保存）
-          - 已保存：灰色
-          - 未标注：默认黑色
+        三态颜色（自动适配深 / 浅色主题）：
+          - 已修改未保存：橙色（高饱和度，两种主题下都醒目）
+          - 已保存：使用系统 Disabled 文本色（浅色主题→灰，深色主题→暗灰）
+          - 未标注：使用系统 Active 文本色（浅色主题→黑，深色主题→白）
         当前选中项额外加粗。
         """
         if not (0 <= index < self._image_list_widget.count()):
@@ -845,12 +854,16 @@ class MainWindow(QMainWindow):
         )
         is_saved = self._is_saved(img_path)
 
+        palette = self._image_list_widget.palette()
         if is_modified:
-            item.setForeground(QBrush(QColor("#e8590c")))   # 橙色
+            # 橙色：浅色主题下深一点，深色主题下也清晰可读
+            item.setForeground(QBrush(QColor("#e8590c")))
         elif is_saved:
-            item.setForeground(QBrush(QColor("#888888")))   # 灰色
+            # 系统 Disabled 文本色（自动深浅模式适配）
+            item.setForeground(palette.brush(QPalette.Disabled, QPalette.Text))
         else:
-            item.setForeground(QBrush(QColor("#000000")))   # 默认黑色
+            # 系统默认文本色（深色主题下会是浅色，浅色主题下会是深色）
+            item.setForeground(palette.brush(QPalette.Active, QPalette.Text))
 
         font = item.font()
         font.setBold(is_current)
