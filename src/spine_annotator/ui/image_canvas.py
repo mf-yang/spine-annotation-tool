@@ -75,8 +75,12 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         self._apply_z_value()
 
     def _build_pen(self, color: QColor, width: int) -> QPen:
-        """根据 keypoint_visibility 决定线型：v=2 实线，v=1 短虚线，v=0 长虚线。"""
+        """根据 keypoint_visibility 决定线型：v=2 实线，v=1 短虚线，v=0 长虚线。
+
+        边框笔使用 cosmetic 模式，线宽在屏幕像素上恒定，不随视图缩放改变。
+        """
         pen = QPen(color, width)
+        pen.setCosmetic(True)  # 屏幕像素级恒定线宽
         v = int(getattr(self.annotation, "keypoint_visibility", 2))
         if v == 1:
             pen.setStyle(Qt.DashLine)
@@ -187,17 +191,24 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         painter.drawEllipse(rotate_pos, (HANDLE_SIZE + 1) * inv_s, (HANDLE_SIZE + 1) * inv_s)
 
     def _draw_label(self, painter, brief: bool = False):
-        """Draw class name label above the box.
+        """Draw class name label above the box (view-scale independent).
 
         brief=True 时仅显示椎骨编号（未选中状态），使用该椎骨分类颜色；
         brief=False 时显示完整信息（选中状态），使用 SELECTED_COLOR。
         """
+        s = self._get_view_scale()
+        inv_s = 1.0 / s if s > 0 else 1.0
+
         if brief:
             label_color = self._get_color()
             font = QFont("Arial", 9, QFont.Bold)
         else:
             label_color = SELECTED_COLOR
             font = QFont("Arial", 10, QFont.Bold)
+
+        painter.save()
+        if s > 0:
+            painter.scale(inv_s, inv_s)
 
         if self.annotation.shape_type == "line":
             p0 = self.annotation.points[0]
@@ -210,6 +221,7 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
             painter.setPen(QPen(label_color))
             painter.setFont(font)
             painter.drawText(QPointF(p0.x, p0.y - 8), label)
+            painter.restore()
             return
 
         p0 = self.annotation.points[0]
@@ -225,6 +237,8 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         painter.setPen(QPen(label_color))
         painter.setFont(font)
         painter.drawText(QPointF(p0.x, p0.y - 8), label)
+
+        painter.restore()
 
     def hit_test_handle(self, scene_pos: QPointF) -> Tuple[str, int]:
         """Test if scene position hits a handle.
