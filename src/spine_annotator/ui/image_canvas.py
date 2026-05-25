@@ -126,9 +126,27 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
             # 未选中也显示椎骨编号，便于快速核对准确性
             self._draw_label(painter, brief=True)
 
+    def _get_view_scale(self) -> float:
+        """获取当前视图的缩放因子（水平方向）。
+
+        用于绘制时反缩放手柄，使其在屏幕上保持恒定像素大小。
+        """
+        scene = self.scene()
+        if not scene:
+            return 1.0
+        views = scene.views()
+        if not views:
+            return 1.0
+        t = views[0].transform()
+        # 欧几里得范数（处理缩放+旋转混合变换）
+        return math.hypot(t.m11(), t.m12()) or 1.0
+
     def _draw_handles(self, painter):
-        """Draw corner handles and rotation handle."""
-        handle_pen = QPen(SELECTED_COLOR, 2)
+        """Draw corner handles and rotation handle (view-scale independent)."""
+        s = self._get_view_scale()
+        inv_s = 1.0 / s if s > 0 else 1.0
+
+        handle_pen = QPen(SELECTED_COLOR, 2 * inv_s)
         handle_brush = QBrush(QColor(255, 255, 0, 120))
         painter.setPen(handle_pen)
         painter.setBrush(handle_brush)
@@ -139,7 +157,7 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
             for p in self.annotation.points[:2]:
                 center = QPointF(p.x, p.y)
                 self._handles.append(center)
-                painter.drawEllipse(center, HANDLE_SIZE, HANDLE_SIZE)
+                painter.drawEllipse(center, HANDLE_SIZE * inv_s, HANDLE_SIZE * inv_s)
             self._rotate_handle = None
             return
 
@@ -148,7 +166,7 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         for p in self.annotation.points:
             center = QPointF(p.x, p.y)
             self._handles.append(center)
-            painter.drawEllipse(center, HANDLE_SIZE, HANDLE_SIZE)
+            painter.drawEllipse(center, HANDLE_SIZE * inv_s, HANDLE_SIZE * inv_s)
 
         # Rotation handle (above top edge midpoint)
         p0 = self.annotation.points[0]
@@ -157,8 +175,8 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         mid_y = (p0.y + p1.y) / 2
 
         angle = self.annotation.angle
-        nx = -math.sin(angle) * ROTATE_HANDLE_OFFSET
-        ny = math.cos(angle) * ROTATE_HANDLE_OFFSET
+        nx = -math.sin(angle) * ROTATE_HANDLE_OFFSET * inv_s
+        ny = math.cos(angle) * ROTATE_HANDLE_OFFSET * inv_s
         # Flip: rotation handle goes "up" (away from the bottom of the spine)
         rotate_pos = QPointF(mid_x + nx, mid_y + ny)
         self._rotate_handle = rotate_pos
@@ -166,7 +184,7 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         # Draw rotation handle line and circle
         painter.drawLine(QPointF(mid_x, mid_y), rotate_pos)
         painter.setBrush(QBrush(QColor(0, 200, 255, 180)))
-        painter.drawEllipse(rotate_pos, HANDLE_SIZE + 1, HANDLE_SIZE + 1)
+        painter.drawEllipse(rotate_pos, (HANDLE_SIZE + 1) * inv_s, (HANDLE_SIZE + 1) * inv_s)
 
     def _draw_label(self, painter, brief: bool = False):
         """Draw class name label above the box.

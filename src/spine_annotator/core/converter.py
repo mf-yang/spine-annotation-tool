@@ -164,30 +164,79 @@ class YOLOConverter:
                     if i >= len(states):
                         continue
                     state = states[i]
-                    # 恢复几何（如果 cache 中有完整点坐标）
-                    pts = state.get("points")
-                    shape_type = state.get("shape_type", "obb")
-                    if shape_type == "line":
-                        # Line 标注：2 个端点
-                        if (
-                            isinstance(pts, list) and len(pts) == 2
-                            and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts)
-                        ):
-                            ann.points = [Point(float(p[0]), float(p[1])) for p in pts]
-                            ann.shape_type = "line"
-                            ann._update_geometry()
-                    elif (
-                        isinstance(pts, list) and len(pts) == 4
-                        and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts)
-                    ):
-                        ann.points = [Point(float(p[0]), float(p[1])) for p in pts]
-                        ann._update_geometry()
-                    # 恢复可见性
-                    ann.keypoint_visibility = int(
-                        state.get("keypoint_visibility", 2)
+                    self._restore_annotation_state(ann, state)
+
+                # 处理 cache 中多余的新增标注（用户新绘制的，文件中尚未保存）
+                for i in range(len(annotation.annotations), len(states)):
+                    state = states[i]
+                    new_ann = self._create_annotation_from_state(
+                        state, img_w, img_h
                     )
+                    if new_ann is not None:
+                        annotation.annotations.append(new_ann)
+
+        elif cache_entry and "annotation_states" in cache_entry:
+            # 文件不存在，但 cache 中有状态：完全从 cache 恢复
+            states = cache_entry["annotation_states"]
+            for state in states:
+                new_ann = self._create_annotation_from_state(
+                    state, img_w, img_h
+                )
+                if new_ann is not None:
+                    annotation.annotations.append(new_ann)
 
         return annotation
+
+    def _restore_annotation_state(self, ann: OBBAnnotation, state: dict):
+        """从 cache state 恢复单个标注的几何与可见性状态。"""
+        pts = state.get("points")
+        shape_type = state.get("shape_type", "obb")
+        if shape_type == "line":
+            if (
+                isinstance(pts, list) and len(pts) == 2
+                and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts)
+            ):
+                ann.points = [Point(float(p[0]), float(p[1])) for p in pts]
+                ann.shape_type = "line"
+                ann._update_geometry()
+        elif (
+            isinstance(pts, list) and len(pts) == 4
+            and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts)
+        ):
+            ann.points = [Point(float(p[0]), float(p[1])) for p in pts]
+            ann._update_geometry()
+        ann.keypoint_visibility = int(state.get("keypoint_visibility", 2))
+
+    def _create_annotation_from_state(self, state: dict,
+                                       img_w: int, img_h: int) -> Optional[OBBAnnotation]:
+        """从 cache state 创建新的 OBBAnnotation（用于恢复新增标注）。"""
+        class_id = state.get("class_id")
+        class_name = state.get("class_name")
+        pts = state.get("points")
+        shape_type = state.get("shape_type", "obb")
+
+        if class_id is None or class_name is None:
+            return None
+        if not isinstance(pts, list) or len(pts) < 2:
+            return None
+
+        try:
+            if shape_type == "line" and len(pts) == 2:
+                p0 = Point(float(pts[0][0]), float(pts[0][1]))
+                p1 = Point(float(pts[1][0]), float(pts[1][1]))
+                ann = OBBAnnotation.from_line(class_id, class_name, p0, p1)
+            elif len(pts) == 4:
+                points = [Point(float(p[0]), float(p[1])) for p in pts]
+                ann = OBBAnnotation(class_id, class_name, points)
+                ann._update_geometry()
+            else:
+                return None
+        except (ValueError, TypeError, IndexError):
+            return None
+
+        ann.keypoint_visibility = int(state.get("keypoint_visibility", 2))
+        ann.shape_type = shape_type
+        return ann
 
     def save_progress_cache(self, cache_path: str, progress: dict):
         """Save progress cache to JSON file."""
@@ -219,6 +268,7 @@ class YOLOConverter:
         """从 ImageAnnotation 提取每个标注的可序列化状态，用于写入 cache。
 
         保存的状态：
+          - class_id / class_name: 标注类别（新增标注恢复时需要）
           - points: 4 个角点或 2 个端点的像素坐标 [[x, y], ...]
           - keypoint_visibility: YOLOv8-pose v 字段
           - shape_type: 'obb' 或 'line'
@@ -226,6 +276,8 @@ class YOLOConverter:
         states = []
         for ann in annotation.annotations:
             states.append({
+                "class_id": ann.class_id,
+                "class_name": ann.class_name,
                 "points": [[round(p.x, 3), round(p.y, 3)] for p in ann.points],
                 "keypoint_visibility": int(ann.keypoint_visibility),
                 "shape_type": ann.shape_type,
