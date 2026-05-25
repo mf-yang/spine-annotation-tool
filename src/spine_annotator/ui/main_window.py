@@ -8,10 +8,10 @@ from typing import List, Optional
 from PyQt5.QtCore import Qt, QSettings, QTimer
 from PyQt5.QtGui import QBrush, QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
-    QAction, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton, QShortcut,
-    QVBoxLayout, QWidget,
+    QAction, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QRadioButton, QShortcut, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .. import __version__
@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
         self._current_draw_class_id: Optional[int] = None
 
         self._init_ui()
+        self._init_menubar()
         self._init_shortcuts()
         self._init_statusbar()
 
@@ -297,24 +298,7 @@ class MainWindow(QMainWindow):
         nav_row.addWidget(self._btn_next)
         right_layout.addLayout(nav_row)
 
-        # Shortcut reference
-        right_layout.addSpacing(12)
-        right_layout.addWidget(self._create_section_label("快捷键"))
-        shortcut_help = QLabel(
-            "旋转: R/E ±5° | T/Y ±1°\n"
-            "精旋: Shift+R/E ±0.5°\n"
-            "移动: W/A/S/D 5px\n"
-            "精移: Shift+W/A/S/D 1px\n"
-            "导航: ←/→ 图片 | ↑/↓ 标注\n"
-            "跳转: Ctrl+N 下一未标注\n"
-            "      Ctrl+B 上一未标注\n"
-            "其他: F 适配 | Esc 取消\n"
-            "      Ctrl+S 保存 | Del 删除\n"
-            "      M 标记难点 | 双击 改编号"
-        )
-        shortcut_help.setStyleSheet(self._muted_text_style(11) + " line-height: 1.4;")
-        shortcut_help.setWordWrap(True)
-        right_layout.addWidget(shortcut_help)
+        # 快捷键帮助已移至 “帮助 → 快捷键” 菜单（快捷键: F1）
 
         # Color legend
         right_layout.addSpacing(8)
@@ -350,6 +334,120 @@ class MainWindow(QMainWindow):
         is_dark = self.palette().color(QPalette.Window).lightness() < 128
         color = "#aaaaaa" if is_dark else "#666666"
         return f"color: {color}; font-size: {font_size}px;"
+
+    def _init_menubar(self):
+        """初始化菜单栏（帮助 -> 快捷键 / 关于）。"""
+        menubar = self.menuBar()
+
+        help_menu = menubar.addMenu("帮助(&H)")
+
+        act_shortcuts = QAction("快捷键(&K)", self)
+        act_shortcuts.setShortcut(QKeySequence("F1"))
+        act_shortcuts.setStatusTip("查看所有快捷键")
+        act_shortcuts.triggered.connect(self._show_shortcut_help)
+        help_menu.addAction(act_shortcuts)
+
+        help_menu.addSeparator()
+
+        act_about = QAction("关于(&A)", self)
+        act_about.setStatusTip("关于本软件")
+        act_about.triggered.connect(self._show_about)
+        help_menu.addAction(act_about)
+
+    def _show_shortcut_help(self):
+        """弹出快捷键帮助对话框（独立窗口）。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("快捷键帮助")
+        dlg.resize(560, 560)
+
+        layout = QVBoxLayout(dlg)
+
+        title = QLabel("<h2 style='margin:0'>快捷键一览</h2>")
+        layout.addWidget(title)
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(self._build_shortcut_html())
+        layout.addWidget(browser, 1)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.button(QDialogButtonBox.Close).clicked.connect(dlg.accept)
+        layout.addWidget(btn_box)
+
+        dlg.exec_()
+
+    def _build_shortcut_html(self) -> str:
+        """构建快捷键帮助 HTML 内容。"""
+        rows = [
+            ("图片导航", [
+                ("← / →",            "上一张 / 下一张图片"),
+                ("↑ / ↓",            "选上 / 选下一个标注"),
+                ("Ctrl+N",            "跳到下一张未标注图片【断点续标】"),
+                ("Ctrl+B",            "跳到上一张未标注图片"),
+            ]),
+            ("标注旋转（需选中标注）", [
+                ("R / E",             "逆/顺时针 ± 5°（粗调）"),
+                ("T / Y",             "逆/顺时针 ± 1°（细调）"),
+                ("Shift+R / Shift+E", "逆/顺时针 ± 0.5°（精调）"),
+            ]),
+            ("标注移动（需选中标注）", [
+                ("W / A / S / D",       "上/左/下/右 移动 5px（粗调）"),
+                ("Shift+W / A / S / D", "上/左/下/右 移动 1px（精调）"),
+            ]),
+            ("标注编辑", [
+                ("双击标注",            "修改椎骨编号"),
+                ("Del",               "删除选中标注"),
+                ("Esc",               "取消选中 / 退出绘制模式"),
+                ("F",                 "适配画布 (Fit)"),
+            ]),
+            ("文件 / 状态", [
+                ("Ctrl+S",            "保存当前图片标注"),
+                ("Ctrl+Z",            "撤销"),
+                ("M",                 "标记/取消标记难点"),
+                ("F1",                "打开本帮助窗口"),
+            ]),
+        ]
+
+        html_parts = [
+            "<style>",
+            "  body { font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif; font-size: 13px; }",
+            "  h3 { color: #2563eb; margin: 14px 0 6px 0; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }",
+            "  table { width: 100%; border-collapse: collapse; }",
+            "  td { padding: 4px 8px; vertical-align: top; }",
+            "  td.key { font-family: 'SF Mono', Menlo, Consolas, monospace; color: #b91c1c; white-space: nowrap; width: 35%; }",
+            "  td.desc { color: #1f2937; }",
+            "</style>",
+        ]
+
+        for section, items in rows:
+            html_parts.append(f"<h3>{section}</h3>")
+            html_parts.append("<table>")
+            for key, desc in items:
+                html_parts.append(
+                    f"<tr><td class='key'>{key}</td><td class='desc'>{desc}</td></tr>"
+                )
+            html_parts.append("</table>")
+
+        html_parts.append(
+            "<p style='color:#6b7280; font-size:12px; margin-top:16px;'>"
+            "提示：选中标注后才能使用旋转/移动/删除类快捷键。"
+            "</p>"
+        )
+
+        return "".join(html_parts)
+
+    def _show_about(self):
+        """关于对话框。"""
+        QMessageBox.about(
+            self,
+            "关于 Spine Annotator",
+            (
+                f"<h3>脊柱椎骨标注工具</h3>"
+                f"<p><b>版本</b>：v{__version__}</p>"
+                f"<p>面向脊柱 X 光片的 OBB 标注工具，支持 C7/T1–T12/L1–L5/S1 分类与多种 YOLO 输出格式。</p>"
+                f"<p style='color:#6b7280;'>按 F1 查看快捷键</p>"
+            ),
+        )
 
     def _init_shortcuts(self):
         """Initialize keyboard shortcuts."""
@@ -389,6 +487,8 @@ class MainWindow(QMainWindow):
             # 跳到下一张 / 上一张未标注图片（断点续标核心快捷键）
             QKeySequence("Ctrl+N"): self._jump_to_next_unannotated,
             QKeySequence("Ctrl+B"): self._jump_to_prev_unannotated,
+            # 帮助快捷键
+            QKeySequence("F1"): self._show_shortcut_help,
         }
         for key, callback in shortcuts.items():
             shortcut = QShortcut(key, self)
