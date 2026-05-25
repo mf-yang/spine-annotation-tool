@@ -165,9 +165,9 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self._create_section_label("绘制工具"))
 
         draw_row = QHBoxLayout()
-        self._btn_draw_rect = QPushButton("矩形")
+        self._btn_draw_rect = QPushButton("矩形 (B)")
         self._btn_draw_rect.setCheckable(True)
-        self._btn_draw_rect.setToolTip("拖拽绘制矩形椎骨标注；绘制完成后弹窗选择椎骨编号")
+        self._btn_draw_rect.setToolTip("拖拽绘制矩形椎骨标注；绘制完成后弹窗选择椎骨编号\n快捷键：B（再次按 B 或 Esc 退出绘制）")
         self._btn_draw_rect.clicked.connect(lambda: self._toggle_draw_mode("rect"))
         draw_row.addWidget(self._btn_draw_rect)
 
@@ -420,6 +420,7 @@ class MainWindow(QMainWindow):
                 ("Shift+W / A / S / D", "上/左/下/右 移动 1px（精调）"),
             ]),
             ("标注编辑", [
+                ("B",                 "进入/退出矩形绘制模式"),
                 ("双击标注",            "修改椎骨编号"),
                 ("Del",               "删除选中标注"),
                 ("Esc",               "取消选中 / 退出绘制模式"),
@@ -507,6 +508,8 @@ class MainWindow(QMainWindow):
             QKeySequence("Escape"): lambda: (self._canvas.select_annotation(-1), self._toggle_draw_mode("none")),
             QKeySequence("F"): self._fit_view,
             QKeySequence("Delete"): self._delete_selected_annotation,
+            # 绘制模式切换：矩形（再按一次退出绘制）
+            QKeySequence("B"): self._toggle_rect_shortcut,
             # 清空当前图片（高危，需二次确认）
             QKeySequence("Ctrl+Shift+Backspace"): self._clear_current_image,
             # 标记难点
@@ -979,6 +982,15 @@ class MainWindow(QMainWindow):
             self._canvas.set_draw_mode(AnnotationCanvas.DRAW_NONE)
         elif shape == "rect":
             self._canvas.set_draw_mode(AnnotationCanvas.DRAW_RECT, class_id=None)
+
+    def _toggle_rect_shortcut(self):
+        """快捷键 B 入口：与点击“矩形”按钮一致（再按一次退出绘制）。
+
+        仅在加载了图片后生效；在其他输入控件聊焦点时依靠 QShortcut 默认上下文不干扰。
+        """
+        if not self._current_annotation:
+            return
+        self._toggle_draw_mode("rect")
 
     def _on_annotation_created(self, annotation: OBBAnnotation):
         """画布上绘制完成后回调，将标注添加到当前图片。"""
