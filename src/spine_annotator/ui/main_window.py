@@ -991,11 +991,8 @@ class MainWindow(QMainWindow):
             self._current_annotation.annotations.pop(orig_idx)
             self._current_annotation.modified = True
 
-        # 重新加载画布
-        self._canvas.load_image(
-            self._current_annotation.image_path,
-            self._current_annotation.annotations
-        )
+        # 重新加载画布（保持当前缩放）
+        self._canvas.reload_annotations(self._current_annotation.annotations)
         self._apply_layer_visibility()
 
         self._update_status()
@@ -1034,11 +1031,8 @@ class MainWindow(QMainWindow):
         if self._current_annotation:
             self._current_annotation.modified = True
 
-        # 刷新画布
-        self._canvas.load_image(
-            self._current_annotation.image_path,
-            self._current_annotation.annotations
-        )
+        # 刷新画布（保持当前缩放）
+        self._canvas.reload_annotations(self._current_annotation.annotations)
         self._apply_layer_visibility()
 
         self._on_annotation_selected(self._canvas._current_selection)

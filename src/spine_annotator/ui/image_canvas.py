@@ -299,6 +299,30 @@ class AnnotationCanvas(QGraphicsView):
 
         self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
 
+    def reload_annotations(self, annotations: List[OBBAnnotation]):
+        """Refresh annotation items on canvas without resetting zoom/pan.
+
+        Use this when annotations are modified (delete, relabel) but the
+        image and viewport transform should stay the same.
+        """
+        # Remove old OBB items from scene
+        for item in self._obb_items:
+            self._scene.removeItem(item)
+        self._obb_items.clear()
+        self._index_map = []
+        self._current_selection = -1
+
+        # Re-add annotations (keep existing pixmap)
+        sorted_anns = sorted(enumerate(annotations), key=lambda x: x[1].width * max(x[1].height, 1), reverse=True)
+
+        for scene_idx, (old_idx, ann) in enumerate(sorted_anns):
+            item = OBBGraphicsItem(ann, old_idx)
+            self._scene.addItem(item)
+            self._obb_items.append(item)
+            self._index_map.append(old_idx)
+
+        self.viewport().update()
+
     def select_annotation(self, index: int):
         """Select annotation by index."""
         # Deselect previous
