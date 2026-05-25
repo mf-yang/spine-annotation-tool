@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QAction, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QRadioButton, QShortcut, QTextBrowser, QVBoxLayout, QWidget,
+    QRadioButton, QScrollArea, QShortcut, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from .. import __version__
@@ -192,13 +192,13 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self._btn_relabel_ann)
 
         # Clear current image annotations (高危操作，红色醒目 + 二次确认)
-        self._btn_clear_current = QPushButton("清空当前图片 (⚠️)")
+        self._btn_clear_current = QPushButton("⚠️ 清空当前图片")
         self._btn_clear_current.setToolTip(
             "删除当前图片的所有标注、对应缓存条目与已导出的 .txt 文件"
             "\n快捷键：Cmd+Shift+Backspace"
         )
         self._btn_clear_current.setStyleSheet(
-            "QPushButton { background-color: #d9534f; color: white; padding: 6px; }"
+            "QPushButton { background-color: #d9534f; color: white; padding: 5px; }"
             "QPushButton:disabled { background-color: #f0a8a5; color: #f3f3f3; }"
         )
         self._btn_clear_current.clicked.connect(self._clear_current_image)
@@ -319,12 +319,22 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(color_legend)
 
         right_layout.addStretch()
-        right_panel.setFixedWidth(240)
+
+        # 包装到滚动区，避免低分辨率 / 窗口高度不足时内容被裁切
+        right_scroll = QScrollArea()
+        right_scroll.setWidget(right_panel)
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QScrollArea.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # 选 248px：240 内容区 + 约 8px 滚动条，避免滚动条出现时横向振荡
+        right_panel.setMinimumWidth(240)
+        right_scroll.setFixedWidth(248)
 
         # --- Assemble ---
         main_layout.addWidget(left_panel)
         main_layout.addWidget(self._canvas, stretch=1)
-        main_layout.addWidget(right_panel)
+        main_layout.addWidget(right_scroll)
 
     def _create_section_label(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -1312,7 +1322,9 @@ class MainWindow(QMainWindow):
                 info["width"], info["height"],
                 cache_entry=self._cache.get(info["image_path"]),
             )
-            self._canvas.set_annotation(self._current_annotation)
+            self._canvas.load_image(
+                info["image_path"], self._current_annotation.annotations
+            )
 
         # 刷新列表项样式与进度
         for i in range(len(self._image_infos)):
@@ -1369,7 +1381,9 @@ class MainWindow(QMainWindow):
         # 1. 清空内存中的标注
         self._current_annotation.annotations.clear()
         self._current_annotation.modified = True
-        self._canvas.set_annotation(self._current_annotation)
+        self._canvas.load_image(
+            info["image_path"], self._current_annotation.annotations
+        )
 
         # 2. 删除缓存条目
         img_path = info["image_path"]
