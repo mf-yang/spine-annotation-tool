@@ -234,8 +234,14 @@ class YOLOConverter:
 
     def _load_labels(self, label_path: Path,
                      img_w: int, img_h: int) -> List[OBBAnnotation]:
-        """Load YOLOv5 format labels and convert to OBB annotations."""
-        annotations = []
+        """Load YOLOv5 format labels and convert to OBB annotations.
+
+        旧数据集兼容：
+        - class_id 1/2 (脊柱外框) 完全跳过
+        - class_id 0 (泛化"Vertebra") 按 center.y 从上到下自动编号为 C7→T1→...→S1
+        - 新数据集 (class_id 0~18 对应 C7~S1) 直接加载
+        """
+        raw_entries: list[tuple[int, float, float, float, float]] = []
 
         with open(label_path, "r") as f:
             for line in f:
@@ -249,24 +255,42 @@ class YOLOConverter:
                 w_norm = float(parts[3])
                 h_norm = float(parts[4])
 
-                # Convert to pixel coordinates
+                # 彻底跳过脊柱外框 (旧 class_id 1/2)
+                if class_id in (1, 2):
+                    continue
+                # 跳过其他未知旧类别
+                category = get_vertebra_category(class_id)
+                if category is None and class_id != 0:
+                    continue
+
                 cx = cx_norm * img_w
                 cy = cy_norm * img_h
                 w = w_norm * img_w
                 h = h_norm * img_h
 
-                class_name = self.class_names.get(class_id, f"class_{class_id}")
+                raw_entries.append((class_id, cx, cy, w, h))
 
-                # 跳过已废弃的脊柱外框类别 (旧 class_id 1/2)
-                category = get_vertebra_category(class_id)
-                if category is None and class_id not in self.class_names:
-                    # 旧格式：class_id 0 = 泛化 "Vertebra"，直接加载
-                    # 旧格式：class_id 1/2 = 脊柱外框，跳过
-                    if class_id in self._LEGACY_CLASS_NAMES and class_id != 0:
-                        continue
-                    if class_id not in self._LEGACY_CLASS_NAMES:
-                        continue
+        # 判断是否为旧格式 (全部为 class_id=0)
+        is_legacy = all(entry[0] == 0 for entry in raw_entries) if raw_entries else False
 
+        annotations: List[OBBAnnotation] = []
+
+        if is_legacy:
+            # 旧格式：按 center.y 从上到下排序，自动编号 C7(0), T1(1), T2(2), ... S1(18)
+            sorted_entries = sorted(raw_entries, key=lambda e: e[2])  # sort by cy
+            for i, (class_id, cx, cy, w, h) in enumerate(sorted_entries):
+                if i < len(VERTEBRA_CLASSES):
+                    auto_class_id = i
+                    auto_class_name = VERTEBRA_CLASSES[i]
+                else:
+                    auto_class_id = i
+                    auto_class_name = f"V{i}"
+                ann = OBBAnnotation.from_aabb(auto_class_id, auto_class_name, cx, cy, w, h)
+                annotations.append(ann)
+        else:
+            # 新格式：直接使用 class_id
+            for class_id, cx, cy, w, h in raw_entries:
+                class_name = VERTEBRA_CLASSES.get(class_id, f"class_{class_id}")
                 ann = OBBAnnotation.from_aabb(class_id, class_name, cx, cy, w, h)
                 annotations.append(ann)
 

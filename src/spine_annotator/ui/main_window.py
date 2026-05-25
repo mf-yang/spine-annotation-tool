@@ -8,9 +8,9 @@ from typing import List, Optional
 from PyQt5.QtCore import Qt, QSettings, QTimer
 from PyQt5.QtGui import QBrush, QColor, QKeySequence, QPalette
 from PyQt5.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QProgressBar, QPushButton, QRadioButton, QShortcut,
+    QAction, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton, QShortcut,
     QVBoxLayout, QWidget,
 )
 
@@ -84,7 +84,18 @@ class MainWindow(QMainWindow):
 
         self._image_list_widget = QListWidget()
         self._image_list_widget.currentRowChanged.connect(self._on_image_selected)
+        self._image_list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._image_list_widget.customContextMenuRequested.connect(self._on_image_list_context_menu)
         left_layout.addWidget(self._image_list_widget)
+
+        # 标记难点按钮
+        flag_row = QHBoxLayout()
+        self._btn_flag = QPushButton("⚑ 标记难点")
+        self._btn_flag.setCheckable(True)
+        self._btn_flag.setToolTip("标记当前图片为标注难点，稍后继续")
+        self._btn_flag.toggled.connect(self._on_flag_toggled)
+        flag_row.addWidget(self._btn_flag)
+        left_layout.addLayout(flag_row)
 
         # Progress
         self._progress_bar = QProgressBar()
@@ -98,6 +109,7 @@ class MainWindow(QMainWindow):
         self._canvas.selection_changed.connect(self._on_annotation_selected)
         self._canvas.annotation_modified.connect(self._on_annotation_modified)
         self._canvas.annotation_created.connect(self._on_annotation_created)
+        self._canvas.annotation_relabel_requested.connect(self._on_relabel_requested)
 
         # --- Right: controls panel ---
         right_panel = QWidget()
@@ -185,6 +197,13 @@ class MainWindow(QMainWindow):
         self._btn_delete_ann.clicked.connect(self._delete_selected_annotation)
         self._btn_delete_ann.setEnabled(False)
         right_layout.addWidget(self._btn_delete_ann)
+
+        # Relabel annotation button
+        self._btn_relabel_ann = QPushButton("更改编号 (双击)")
+        self._btn_relabel_ann.setToolTip("双击标注或点此按钮修改椎骨编号")
+        self._btn_relabel_ann.clicked.connect(self._relabel_selected_annotation)
+        self._btn_relabel_ann.setEnabled(False)
+        right_layout.addWidget(self._btn_relabel_ann)
 
         right_layout.addSpacing(12)
 
@@ -299,7 +318,8 @@ class MainWindow(QMainWindow):
             "跳转: Ctrl+N 下一未标注\n"
             "      Ctrl+B 上一未标注\n"
             "其他: F 适配 | Esc 取消\n"
-            "      Ctrl+S 保存 | Del 删除"
+            "      Ctrl+S 保存 | Del 删除\n"
+            "      M 标记难点 | 双击 改编号"
         )
         shortcut_help.setStyleSheet(self._muted_text_style(11) + " line-height: 1.4;")
         shortcut_help.setWordWrap(True)
@@ -373,6 +393,8 @@ class MainWindow(QMainWindow):
             QKeySequence("Escape"): lambda: (self._canvas.select_annotation(-1), self._toggle_draw_mode("none")),
             QKeySequence("F"): self._fit_view,
             QKeySequence("Delete"): self._delete_selected_annotation,
+            # 标记难点
+            QKeySequence("M"): self._toggle_flag_current,
             # 跳到下一张 / 上一张未标注图片（断点续标核心快捷键）
             QKeySequence("Ctrl+N"): self._jump_to_next_unannotated,
             QKeySequence("Ctrl+B"): self._jump_to_prev_unannotated,
@@ -515,6 +537,70 @@ class MainWindow(QMainWindow):
     def _is_saved(self, image_path: str) -> bool:
         return bool(self._cache.get(image_path, {}).get("saved"))
 
+    def _is_flagged(self, image_path: str) -> bool:
+        """检查图片是否被标记为标注难点。"""
+        return bool(self._cache.get(image_path, {}).get("flagged"))
+
+    def _set_flagged(self, image_path: str, flagged: bool):
+        """设置/取消标记难点。"""
+        entry = self._cache.setdefault(image_path, {})
+        entry["flagged"] = flagged
+        # 持久化到 cache 文件
+        if self._progress_cache_path:
+            self._converter.save_progress_cache(self._progress_cache_path, self._cache)
+
+    def _on_flag_toggled(self, checked: bool):
+        """标记难点按钮切换回调。"""
+        if self._current_index < 0 or not self._image_infos:
+            return
+        img_path = self._image_infos[self._current_index]["image_path"]
+        self._set_flagged(img_path, checked)
+        self._apply_item_style(self._current_index)
+        self._update_status()
+
+    def _on_image_list_context_menu(self, pos):
+        """图片列表右键菜单。"""
+        item = self._image_list_widget.itemAt(pos)
+        if item is None:
+            return
+
+        row = self._image_list_widget.row(item)
+        img_path = self._image_infos[row]["image_path"]
+        is_flagged = self._is_flagged(img_path)
+
+        menu = QMenu(self)
+        flag_action = QAction(
+            "取消标记" if is_flagged else "标记难点",
+            self
+        )
+        flag_action.triggered.connect(lambda: self._toggle_flag_by_row(row))
+        menu.addAction(flag_action)
+
+        go_action = QAction("跳转到此图片", self)
+        go_action.triggered.connect(lambda: self._go_to_image(row))
+        menu.addAction(go_action)
+
+        menu.exec_(self._image_list_widget.mapToGlobal(pos))
+
+    def _toggle_flag_by_row(self, row: int):
+        """根据行号切换标记难点状态。"""
+        img_path = self._image_infos[row]["image_path"]
+        new_flag = not self._is_flagged(img_path)
+        self._set_flagged(img_path, new_flag)
+        self._apply_item_style(row)
+        # 如果是当前图片，同步按钮状态
+        if row == self._current_index:
+            self._btn_flag.blockSignals(True)
+            self._btn_flag.setChecked(new_flag)
+            self._btn_flag.blockSignals(False)
+        self._update_status()
+
+    def _toggle_flag_current(self):
+        """快捷键M：切换当前图片的标记难点状态。"""
+        if self._current_index < 0 or not self._image_infos:
+            return
+        self._toggle_flag_by_row(self._current_index)
+
     def _set_output_dir(self):
         """Set the output directory for exported annotations."""
         start_dir = self._settings.value(self.SETTINGS_LAST_OUTPUT, str(Path.home()))
@@ -543,14 +629,9 @@ class MainWindow(QMainWindow):
         if not (0 <= index < len(self._image_infos)):
             return
 
-        # 切换前持久化当前张：
-        #   - 已设置 output_dir：正常保存（写 labels 文件 + cache）
-        #   - 未设置 output_dir：仍把 OBB 几何状态记入 cache，避免丢失编辑
+        # 切换前持久化当前张 OBB 几何到 cache（仅防编辑丢失，不算正式保存）
         if self._current_index >= 0 and self._current_annotation and self._current_annotation.modified:
-            if self._output_dir:
-                self._save_current(silent=True)
-            else:
-                self._checkpoint_geometry_to_cache()
+            self._checkpoint_geometry_to_cache()
 
         prev_index = self._current_index
         self._current_index = index
@@ -578,6 +659,12 @@ class MainWindow(QMainWindow):
         if prev_index >= 0 and prev_index != index:
             self._apply_item_style(prev_index)
         self._apply_item_style(index)
+
+        # 同步标记难点按钮状态
+        is_flagged = self._is_flagged(info["image_path"])
+        self._btn_flag.blockSignals(True)
+        self._btn_flag.setChecked(is_flagged)
+        self._btn_flag.blockSignals(False)
 
         self._update_status()
 
@@ -624,6 +711,7 @@ class MainWindow(QMainWindow):
             self._ann_info_label.setText("无选中")
             self._sync_visibility_radios(default_v=2, enabled=False)
             self._btn_delete_ann.setEnabled(False)
+            self._btn_relabel_ann.setEnabled(False)
             return
 
         # Map scene index to original annotation index
@@ -657,6 +745,7 @@ class MainWindow(QMainWindow):
             # Sync visibility radio buttons
             self._sync_visibility_radios(int(ann.keypoint_visibility), enabled=True)
             self._btn_delete_ann.setEnabled(True)
+            self._btn_relabel_ann.setEnabled(True)
 
     def _sync_visibility_radios(self, default_v: int, enabled: bool):
         """同步右侧"关键点可见性" radio button 至给定 v 值（不触发回调）。"""
@@ -841,7 +930,7 @@ class MainWindow(QMainWindow):
         if self._current_index >= 0:
             self._apply_item_style(self._current_index)
 
-    def _prompt_vertebra_selection(self) -> Optional[int]:
+    def _prompt_vertebra_selection(self, current_class_id: Optional[int] = None) -> Optional[int]:
         """弹出椎骨类型选择对话框，返回 class_id 或 None(取消)。"""
         categories = [
             "颈椎 (C)",
@@ -854,8 +943,17 @@ class MainWindow(QMainWindow):
             "骶椎 (S)",
             "  S1",
         ]
+        # 预选当前椎骨
+        default_idx = 0
+        if current_class_id is not None:
+            current_name = VERTEBRA_CLASSES.get(current_class_id, "")
+            for i, cat in enumerate(categories):
+                if cat.strip() == current_name:
+                    default_idx = i
+                    break
+
         name, ok = QInputDialog.getItem(
-            self, "选择椎骨类型", "请选择标注的椎骨:", categories, 0, False
+            self, "选择椎骨类型", "请选择标注的椎骨:", categories, default_idx, False
         )
         if not ok:
             return None
@@ -903,6 +1001,52 @@ class MainWindow(QMainWindow):
         self._update_status()
         if self._current_index >= 0:
             self._apply_item_style(self._current_index)
+
+    def _on_relabel_requested(self, scene_idx: int):
+        """双击标注后弹出椎骨编号修改对话框。"""
+        if not self._current_annotation:
+            return
+        if scene_idx < 0 or scene_idx >= len(self._canvas._obb_items):
+            return
+
+        orig_idx = self._canvas._index_map[scene_idx]
+        if orig_idx < 0 or orig_idx >= len(self._current_annotation.annotations):
+            return
+
+        ann = self._current_annotation.annotations[orig_idx]
+        self._relabel_annotation(ann)
+
+    def _relabel_selected_annotation(self):
+        """按钮点击：对当前选中的标注执行更改编号。"""
+        ann = self._canvas.get_selected_annotation()
+        if ann is None:
+            return
+        self._relabel_annotation(ann)
+
+    def _relabel_annotation(self, ann: OBBAnnotation):
+        """弹出椎骨编号选择对话框并更改标注编号。"""
+        new_class_id = self._prompt_vertebra_selection(current_class_id=ann.class_id)
+        if new_class_id is None or new_class_id == ann.class_id:
+            return  # 取消或未变
+
+        ann.class_id = new_class_id
+        ann.class_name = VERTEBRA_CLASSES[new_class_id]
+        if self._current_annotation:
+            self._current_annotation.modified = True
+
+        # 刷新画布
+        self._canvas.load_image(
+            self._current_annotation.image_path,
+            self._current_annotation.annotations
+        )
+        self._apply_layer_visibility()
+
+        self._on_annotation_selected(self._canvas._current_selection)
+        self._update_status()
+        if self._current_index >= 0:
+            self._apply_item_style(self._current_index)
+
+        self.statusBar().showMessage(f"编号已更改为 {ann.class_name}", 2000)
 
     # --- Save Operations ---
 
@@ -1053,12 +1197,20 @@ class MainWindow(QMainWindow):
             self._status_label.setText("")
             return
         info = self._image_infos[self._current_index]
-        modified_str = " [未保存]" if self._current_annotation.modified else ""
-        saved_str = " ✓" if self._is_saved(info["image_path"]) else ""
+        parts = []
+        if self._current_annotation.modified:
+            parts.append("⚠ 未保存")
+        if self._is_flagged(info["image_path"]):
+            parts.append("⚑ 难点")
+        if self._is_saved(info["image_path"]):
+            parts.append("✓")
+        flags_str = " | ".join(parts)
+        if flags_str:
+            flags_str = f" [{flags_str}]"
         self._status_label.setText(
             f"{self._current_index + 1}/{len(self._image_infos)} | "
-            f"{Path(info['image_path']).name}{saved_str} | "
-            f"{len(self._current_annotation.annotations)} 个标注{modified_str}"
+            f"{Path(info['image_path']).name}{flags_str} | "
+            f"{len(self._current_annotation.annotations)} 个标注"
         )
 
     # --- 列表项三态视觉样式 ---
@@ -1066,10 +1218,12 @@ class MainWindow(QMainWindow):
     def _apply_item_style(self, index: int):
         """更新单个列表项的颜色 + 加粗状态。
 
-        三态颜色（自动适配深 / 浅色主题）：
-          - 已修改未保存：橙色（高饱和度，两种主题下都醒目）
-          - 已保存：使用系统 Disabled 文本色（浅色主题→灰，深色主题→暗灰）
-          - 未标注：使用系统 Active 文本色（浅色主题→黑，深色主题→白）
+        状态颜色（自动适配深 / 浅色主题）：
+          - 已修改未保存：橙色（高饱和度，醒目提示）
+          - 已保存：使用系统 Disabled 文本色（灰色，表示已完成）
+          - 有标注(未保存)：系统 Active 文本色
+          - 未标注：系统 Active 文本色
+          - 已标记难点：前面加 ⚑ 前缀
         当前选中项额外加粗。
         """
         if not (0 <= index < self._image_list_widget.count()):
@@ -1087,16 +1241,27 @@ class MainWindow(QMainWindow):
             and self._current_annotation.modified
         )
         is_saved = self._is_saved(img_path)
+        is_flagged = self._is_flagged(img_path)
+
+        # 更新显示文本（加 ⚑ 前缀表示标记难点）
+        name = Path(info["image_path"]).stem
+        split = info.get("split", "")
+        display = f"⚑ [{split}] {name}" if (is_flagged and split) else (
+            f"⚑ {name}" if is_flagged else (
+                f"[{split}] {name}" if split else name
+            )
+        )
+        item.setText(display)
 
         palette = self._image_list_widget.palette()
         if is_modified:
-            # 橙色：浅色主题下深一点，深色主题下也清晰可读
+            # 橙色：醒目提示有未保存修改
             item.setForeground(QBrush(QColor("#e8590c")))
         elif is_saved:
             # 系统 Disabled 文本色（自动深浅模式适配）
             item.setForeground(palette.brush(QPalette.Disabled, QPalette.Text))
         else:
-            # 系统默认文本色（深色主题下会是浅色，浅色主题下会是深色）
+            # 系统默认文本色
             item.setForeground(palette.brush(QPalette.Active, QPalette.Text))
 
         font = item.font()

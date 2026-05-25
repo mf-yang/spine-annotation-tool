@@ -216,6 +216,7 @@ class AnnotationCanvas(QGraphicsView):
     selection_changed = pyqtSignal(int)  # emits annotation index, -1 if none
     annotation_modified = pyqtSignal()
     annotation_created = pyqtSignal(object)  # emits the newly created OBBAnnotation
+    annotation_relabel_requested = pyqtSignal(int)  # emits scene index of double-clicked annotation
 
     # 绘制模式
     DRAW_NONE = "none"       # 选择/编辑模式
@@ -518,6 +519,36 @@ class AnnotationCanvas(QGraphicsView):
         if event.angleDelta().y() < 0:
             factor = 1.0 / factor
         self.scale(factor, factor)
+
+    def mouseDoubleClickEvent(self, event):
+        """双击标注时弹出椎骨编号修改请求。"""
+        if event.button() != Qt.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+
+        scene_pos = self.mapToScene(event.pos())
+
+        # 查找被双击的标注
+        clicked_item = None
+        for item in reversed(sorted(self._obb_items, key=lambda it: it.zValue())):
+            if not item.isVisible():
+                continue
+            if item.shape().contains(item.mapFromScene(scene_pos)):
+                clicked_item = item
+                break
+
+        if clicked_item is not None:
+            scene_idx = -1
+            for i, item in enumerate(self._obb_items):
+                if item is clicked_item:
+                    scene_idx = i
+                    break
+            if scene_idx >= 0:
+                self.select_annotation(scene_idx)
+                self.annotation_relabel_requested.emit(scene_idx)
+                return
+
+        super().mouseDoubleClickEvent(event)
 
     # --- 绘制辅助方法 ---
 
