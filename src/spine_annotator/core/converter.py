@@ -252,6 +252,81 @@ class YOLOConverter:
         with open(cache_path, "r") as f:
             return json.load(f)
 
+    # --- 清空标注数据 ---
+
+    def collect_label_files(self, output_dir: str, split: str) -> List[Path]:
+        """收集指定 split 下所有 *.txt 训练标注文件。根据保存逻辑两种布局：
+          - split 非空：{output_dir}/{split}/labels/*.txt
+          - split 为空：{output_dir}/*.txt
+        仅返回真实存在的普通文件（排除软链接）。
+        """
+        if not output_dir:
+            return []
+        out = Path(output_dir).resolve()
+        if not out.exists() or not out.is_dir():
+            return []
+
+        if split:
+            d = out / split / "labels"
+            if not (d.exists() and d.is_dir() and not d.is_symlink()):
+                return []
+            candidates = sorted(d.glob("*.txt"))
+        else:
+            candidates = sorted(out.glob("*.txt"))
+
+        result: List[Path] = []
+        for p in candidates:
+            if p.is_file() and not p.is_symlink():
+                result.append(p)
+        return result
+
+    def clear_outputs(self, output_dir: str, split: str) -> dict:
+        """删除指定 split 下所有 *.txt 训练标注文件（不可恢复）。
+
+        仅删除 .txt 文件本身，不删除目录，不递归。
+        返回: {'deleted': N, 'failed': [(path, err), ...], 'paths': [str, ...]}
+        """
+        files = self.collect_label_files(output_dir, split)
+        deleted: List[str] = []
+        failed: List[Tuple[str, str]] = []
+        for p in files:
+            try:
+                p.unlink()
+                deleted.append(str(p))
+            except OSError as e:
+                failed.append((str(p), str(e)))
+        return {"deleted": len(deleted), "failed": failed, "paths": deleted}
+
+    def clear_progress_cache(self, cache_path: str) -> bool:
+        """删除进度缓存文件。返回是否实际删除了文件。"""
+        if not cache_path:
+            return False
+        p = Path(cache_path)
+        if not p.exists() or not p.is_file() or p.is_symlink():
+            return False
+        try:
+            p.unlink()
+            return True
+        except OSError:
+            return False
+
+    def clear_label_for(self, image_stem: str, output_dir: str, split: str) -> bool:
+        """删除单张图片对应的标注文件。返回是否实际删除了文件。"""
+        if not image_stem or not output_dir:
+            return False
+        out = Path(output_dir).resolve()
+        if split:
+            label_path = out / split / "labels" / f"{image_stem}.txt"
+        else:
+            label_path = out / f"{image_stem}.txt"
+        if not label_path.exists() or not label_path.is_file() or label_path.is_symlink():
+            return False
+        try:
+            label_path.unlink()
+            return True
+        except OSError:
+            return False
+
     # --- cache 元信息 helpers ---
 
     def get_last_image_path(self, cache: dict) -> Optional[str]:

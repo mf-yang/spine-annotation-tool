@@ -191,6 +191,20 @@ class MainWindow(QMainWindow):
         self._btn_relabel_ann.setEnabled(False)
         right_layout.addWidget(self._btn_relabel_ann)
 
+        # Clear current image annotations (高危操作，红色醒目 + 二次确认)
+        self._btn_clear_current = QPushButton("清空当前图片 (⚠️)")
+        self._btn_clear_current.setToolTip(
+            "删除当前图片的所有标注、对应缓存条目与已导出的 .txt 文件"
+            "\n快捷键：Cmd+Shift+Backspace"
+        )
+        self._btn_clear_current.setStyleSheet(
+            "QPushButton { background-color: #d9534f; color: white; padding: 6px; }"
+            "QPushButton:disabled { background-color: #f0a8a5; color: #f3f3f3; }"
+        )
+        self._btn_clear_current.clicked.connect(self._clear_current_image)
+        self._btn_clear_current.setEnabled(False)
+        right_layout.addWidget(self._btn_clear_current)
+
         right_layout.addSpacing(12)
 
         # Layer control
@@ -330,8 +344,15 @@ class MainWindow(QMainWindow):
         return f"color: {color}; font-size: {font_size}px;"
 
     def _init_menubar(self):
-        """初始化菜单栏（帮助 -> 快捷键 / 关于）。"""
+        """初始化菜单栏（工具 / 帮助）。"""
         menubar = self.menuBar()
+
+        # 工具菜单
+        tools_menu = menubar.addMenu("工具(&T)")
+        act_clear_all = QAction("清空所有标注…", self)
+        act_clear_all.setStatusTip("删除进度缓存与当前 split 的训练标注文件（不可恢复）")
+        act_clear_all.triggered.connect(self._clear_all_data)
+        tools_menu.addAction(act_clear_all)
 
         help_menu = menubar.addMenu("帮助(&H)")
 
@@ -476,6 +497,8 @@ class MainWindow(QMainWindow):
             QKeySequence("Escape"): lambda: (self._canvas.select_annotation(-1), self._toggle_draw_mode("none")),
             QKeySequence("F"): self._fit_view,
             QKeySequence("Delete"): self._delete_selected_annotation,
+            # 清空当前图片（高危，需二次确认）
+            QKeySequence("Ctrl+Shift+Backspace"): self._clear_current_image,
             # 标记难点
             QKeySequence("M"): self._toggle_flag_current,
             # 跳到下一张 / 上一张未标注图片（断点续标核心快捷键）
@@ -549,6 +572,7 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(f"已扫描 {len(self._image_infos)} 张图片")
         self._btn_save_all.setEnabled(True)
+        self._btn_clear_current.setEnabled(True)
 
         # 持久化数据集目录
         self._settings.setValue(self.SETTINGS_LAST_DATASET, dir_path)
@@ -1231,6 +1255,145 @@ class MainWindow(QMainWindow):
             self._apply_item_style(i)
 
         self.statusBar().showMessage(f"已导出 {count} 个标注文件")
+
+    # --- 清空标注数据 ---
+
+    def _current_split(self) -> str:
+        """获取当前选中图片所在 split（没有选中则返回空串）。"""
+        if not self._image_infos or self._current_index < 0:
+            return ""
+        return self._image_infos[self._current_index].get("split", "")
+
+    def _clear_all_data(self):
+        """菜单入口：弹出 ClearDataDialog，清空进度缓存 + 当前 split 的训练标注。"""
+        from .clear_dialog import ClearDataDialog
+
+        if not self._image_infos:
+            QMessageBox.information(self, "提示", "请先加载图片数据集。")
+            return
+
+        split = self._current_split()
+        label_files = []
+        if self._output_dir:
+            label_files = self._converter.collect_label_files(self._output_dir, split)
+
+        dlg = ClearDataDialog(
+            self,
+            cache_path=self._progress_cache_path,
+            output_dir=self._output_dir,
+            split=split,
+            label_files=label_files,
+        )
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        opts = dlg.get_options()
+        deleted_labels = 0
+        cache_cleared = False
+        failed_msgs = []
+
+        if opts.get("clear_labels") and self._output_dir:
+            result = self._converter.clear_outputs(self._output_dir, split)
+            deleted_labels = result["deleted"]
+            for path, err in result.get("failed", []):
+                failed_msgs.append(f"{path}: {err}")
+
+        if opts.get("clear_cache"):
+            cache_cleared = self._converter.clear_progress_cache(self._progress_cache_path)
+            if cache_cleared:
+                # 同时重置内存中的缓存对象
+                self._cache = {}
+
+        # 重载当前图片从磁盘（label 文件已删），刷新画布
+        if self._current_index >= 0 and self._current_index < len(self._image_infos):
+            info = self._image_infos[self._current_index]
+            self._current_annotation = self._converter.load_single(
+                info["image_path"], info["label_path"],
+                info["width"], info["height"],
+                cache_entry=self._cache.get(info["image_path"]),
+            )
+            self._canvas.set_annotation(self._current_annotation)
+
+        # 刷新列表项样式与进度
+        for i in range(len(self._image_infos)):
+            self._apply_item_style(i)
+        self._update_progress()
+        self._update_status()
+
+        # 反馈
+        msg_parts = []
+        if cache_cleared:
+            msg_parts.append("已删除进度缓存")
+        if deleted_labels > 0:
+            msg_parts.append(f"已删除 {deleted_labels} 个标注文件")
+        if not msg_parts:
+            msg_parts.append("未删除任何文件")
+        summary = "；".join(msg_parts)
+        if failed_msgs:
+            QMessageBox.warning(
+                self, "清空完成（部分失败）",
+                summary + "\n\n以下文件删除失败：\n" + "\n".join(failed_msgs[:10]),
+            )
+        else:
+            self.statusBar().showMessage(summary, 5000)
+
+    def _clear_current_image(self):
+        """清空当前图片的标注、缓存条目与已导出 .txt（需二次确认）。"""
+        if not self._image_infos or self._current_index < 0:
+            return
+        if self._current_annotation is None:
+            return
+
+        info = self._image_infos[self._current_index]
+        img_name = Path(info["image_path"]).name
+        n_ann = len(self._current_annotation.annotations)
+
+        reply = QMessageBox.question(
+            self, "清空当前图片",
+            (
+                f"确定清空当前图片的所有标注吗？\n\n"
+                f"图片：{img_name}\n"
+                f"当前标注数：{n_ann}\n\n"
+                f"将执行：\n"
+                f"  • 清空画布上的所有标注\n"
+                f"  • 删除 .annotate_progress.json 中该图片的缓存条目\n"
+                f"  • 删除对应的已导出 .txt 文件（如果存在）\n\n"
+                f"此操作不可恢复。"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # 1. 清空内存中的标注
+        self._current_annotation.annotations.clear()
+        self._current_annotation.modified = True
+        self._canvas.set_annotation(self._current_annotation)
+
+        # 2. 删除缓存条目
+        img_path = info["image_path"]
+        if img_path in self._cache:
+            del self._cache[img_path]
+        if self._progress_cache_path:
+            self._converter.save_progress_cache(self._progress_cache_path, self._cache)
+
+        # 3. 删除对应 .txt 文件
+        deleted_label = False
+        if self._output_dir:
+            split = info.get("split", "")
+            stem = Path(img_path).stem
+            deleted_label = self._converter.clear_label_for(stem, self._output_dir, split)
+
+        # 4. 刷新 UI
+        self._apply_item_style(self._current_index)
+        self._update_progress()
+        self._update_status()
+
+        msg = f"已清空当前图片标注"
+        if deleted_label:
+            msg += "（同时删除了 .txt 文件）"
+        self.statusBar().showMessage(msg, 4000)
 
     def _update_progress(self):
         """Update progress bar + 永久进度标签。"""
