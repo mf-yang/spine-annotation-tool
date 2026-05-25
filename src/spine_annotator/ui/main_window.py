@@ -15,8 +15,11 @@ from PyQt5.QtWidgets import (
 )
 
 from ..core.converter import YOLOConverter
-from ..core.models import ImageAnnotation
-from .image_canvas import AnnotationCanvas
+from ..core.models import (
+    ImageAnnotation, OBBAnnotation, VERTEBRA_CLASSES,
+    VertebraCategory, get_vertebra_category, get_vertebra_class_id,
+)
+from .image_canvas import AnnotationCanvas, CATEGORY_COLORS
 
 
 class MainWindow(QMainWindow):
@@ -49,8 +52,14 @@ class MainWindow(QMainWindow):
         self._cache: dict = {}  # progress cache
         
         # Layer visibility
-        self._show_vertebrae = True
-        self._show_spine = True
+        self._show_cervical = True
+        self._show_thoracic = True
+        self._show_lumbar = True
+        self._show_sacral = True
+
+        # 绘制模式状态
+        self._current_draw_shape: str = "none"  # "none", "rect", "line"
+        self._current_draw_class_id: Optional[int] = None
 
         self._init_ui()
         self._init_shortcuts()
@@ -88,6 +97,7 @@ class MainWindow(QMainWindow):
         self._canvas = AnnotationCanvas()
         self._canvas.selection_changed.connect(self._on_annotation_selected)
         self._canvas.annotation_modified.connect(self._on_annotation_modified)
+        self._canvas.annotation_created.connect(self._on_annotation_created)
 
         # --- Right: controls panel ---
         right_panel = QWidget()
@@ -137,18 +147,69 @@ class MainWindow(QMainWindow):
 
         right_layout.addSpacing(16)
 
+        # Drawing tools
+        right_layout.addWidget(self._create_section_label("绘制工具"))
+
+        draw_row = QHBoxLayout()
+        self._btn_draw_rect = QPushButton("矩形")
+        self._btn_draw_rect.setCheckable(True)
+        self._btn_draw_rect.setToolTip("拖拽绘制矩形椎骨标注")
+        self._btn_draw_rect.clicked.connect(lambda: self._toggle_draw_mode("rect"))
+        draw_row.addWidget(self._btn_draw_rect)
+
+        self._btn_draw_line = QPushButton("直线")
+        self._btn_draw_line.setCheckable(True)
+        self._btn_draw_line.setToolTip("拖拽绘制直线椎骨标注 (S1顶部)")
+        self._btn_draw_line.clicked.connect(lambda: self._toggle_draw_mode("line"))
+        draw_row.addWidget(self._btn_draw_line)
+
+        self._btn_draw_select = QPushButton("选择")
+        self._btn_draw_select.setCheckable(True)
+        self._btn_draw_select.setChecked(True)
+        self._btn_draw_select.setToolTip("切回选择/编辑模式")
+        self._btn_draw_select.clicked.connect(lambda: self._toggle_draw_mode("none"))
+        draw_row.addWidget(self._btn_draw_select)
+
+        right_layout.addLayout(draw_row)
+
+        # Vertebra type selector for drawing
+        vert_row = QHBoxLayout()
+        vert_row.addWidget(QLabel("椎骨:"))
+        self._vertebra_combo = QComboBox()
+        self._populate_vertebra_combo()
+        vert_row.addWidget(self._vertebra_combo)
+        right_layout.addLayout(vert_row)
+
+        # Delete annotation button
+        self._btn_delete_ann = QPushButton("删除选中标注 (Del)")
+        self._btn_delete_ann.clicked.connect(self._delete_selected_annotation)
+        self._btn_delete_ann.setEnabled(False)
+        right_layout.addWidget(self._btn_delete_ann)
+
+        right_layout.addSpacing(12)
+
         # Layer control
         right_layout.addWidget(self._create_section_label("图层控制"))
-        
-        self._chk_vertebrae = QCheckBox("显示椎骨框 (绿色)")
-        self._chk_vertebrae.setChecked(True)
-        self._chk_vertebrae.stateChanged.connect(self._on_layer_changed)
-        right_layout.addWidget(self._chk_vertebrae)
-        
-        self._chk_spine = QCheckBox("显示脊柱框 (红色/蓝色)")
-        self._chk_spine.setChecked(True)
-        self._chk_spine.stateChanged.connect(self._on_layer_changed)
-        right_layout.addWidget(self._chk_spine)
+
+        self._chk_cervical = QCheckBox("颈椎 C (青色)")
+        self._chk_cervical.setChecked(True)
+        self._chk_cervical.stateChanged.connect(self._on_layer_changed)
+        right_layout.addWidget(self._chk_cervical)
+
+        self._chk_thoracic = QCheckBox("胸椎 T (绿色)")
+        self._chk_thoracic.setChecked(True)
+        self._chk_thoracic.stateChanged.connect(self._on_layer_changed)
+        right_layout.addWidget(self._chk_thoracic)
+
+        self._chk_lumbar = QCheckBox("腰椎 L (橙色)")
+        self._chk_lumbar.setChecked(True)
+        self._chk_lumbar.stateChanged.connect(self._on_layer_changed)
+        right_layout.addWidget(self._chk_lumbar)
+
+        self._chk_sacral = QCheckBox("骶椎 S (紫色)")
+        self._chk_sacral.setChecked(True)
+        self._chk_sacral.stateChanged.connect(self._on_layer_changed)
+        right_layout.addWidget(self._chk_sacral)
 
         right_layout.addSpacing(12)
 
@@ -238,7 +299,7 @@ class MainWindow(QMainWindow):
             "跳转: Ctrl+N 下一未标注\n"
             "      Ctrl+B 上一未标注\n"
             "其他: F 适配 | Esc 取消\n"
-            "      Ctrl+S 保存"
+            "      Ctrl+S 保存 | Del 删除"
         )
         shortcut_help.setStyleSheet(self._muted_text_style(11) + " line-height: 1.4;")
         shortcut_help.setWordWrap(True)
@@ -247,7 +308,8 @@ class MainWindow(QMainWindow):
         # Color legend
         right_layout.addSpacing(8)
         color_legend = QLabel(
-            "■ 绿色: 椎骨 | ■ 红/蓝: 脊柱"
+            "■ 青色: 颈椎 C | ■ 绿色: 胸椎 T\n"
+            "■ 橙色: 腰椎 L | ■ 紫色: 骶椎 S"
         )
         color_legend.setStyleSheet(self._muted_text_style(11))
         color_legend.setWordWrap(True)
@@ -308,8 +370,9 @@ class MainWindow(QMainWindow):
             # Save / undo / fit
             QKeySequence("Ctrl+S"): self._save_current,
             QKeySequence("Ctrl+Z"): self._undo,
-            QKeySequence("Escape"): lambda: self._canvas.select_annotation(-1),
+            QKeySequence("Escape"): lambda: (self._canvas.select_annotation(-1), self._toggle_draw_mode("none")),
             QKeySequence("F"): self._fit_view,
+            QKeySequence("Delete"): self._delete_selected_annotation,
             # 跳到下一张 / 上一张未标注图片（断点续标核心快捷键）
             QKeySequence("Ctrl+N"): self._jump_to_next_unannotated,
             QKeySequence("Ctrl+B"): self._jump_to_prev_unannotated,
@@ -560,6 +623,7 @@ class MainWindow(QMainWindow):
         if index < 0 or not self._current_annotation:
             self._ann_info_label.setText("无选中")
             self._sync_visibility_radios(default_v=2, enabled=False)
+            self._btn_delete_ann.setEnabled(False)
             return
 
         # Map scene index to original annotation index
@@ -574,8 +638,13 @@ class MainWindow(QMainWindow):
             v_label = {2: "可见", 1: "遮挡", 0: "不可见"}.get(
                 int(ann.keypoint_visibility), "可见"
             )
+            category = get_vertebra_category(ann.class_id)
+            category_name = VertebraCategory.CATEGORY_NAMES.get(category, "未知") if category else "未知"
+            shape_label = "直线" if ann.shape_type == "line" else "矩形"
             self._ann_info_label.setText(
-                f"类别: {ann.class_name} (ID={ann.class_id})\n"
+                f"椎骨: {ann.class_name} (ID={ann.class_id})\n"
+                f"类别: {category_name}\n"
+                f"形状: {shape_label}\n"
                 f"角度: {angle_deg:.1f}°\n"
                 f"尺寸: {ann.width:.0f} x {ann.height:.0f}\n"
                 f"中心: ({ann.center.x:.0f}, {ann.center.y:.0f})\n"
@@ -587,6 +656,7 @@ class MainWindow(QMainWindow):
             self._angle_spin.blockSignals(False)
             # Sync visibility radio buttons
             self._sync_visibility_radios(int(ann.keypoint_visibility), enabled=True)
+            self._btn_delete_ann.setEnabled(True)
 
     def _sync_visibility_radios(self, default_v: int, enabled: bool):
         """同步右侧"关键点可见性" radio button 至给定 v 值（不触发回调）。"""
@@ -632,20 +702,29 @@ class MainWindow(QMainWindow):
 
     def _on_layer_changed(self):
         """Handle layer visibility checkbox changes."""
-        self._show_vertebrae = self._chk_vertebrae.isChecked()
-        self._show_spine = self._chk_spine.isChecked()
+        self._show_cervical = self._chk_cervical.isChecked()
+        self._show_thoracic = self._chk_thoracic.isChecked()
+        self._show_lumbar = self._chk_lumbar.isChecked()
+        self._show_sacral = self._chk_sacral.isChecked()
         self._apply_layer_visibility()
         self._canvas.viewport().update()
 
     def _apply_layer_visibility(self):
-        """Apply layer visibility to all annotations."""
+        """Apply layer visibility to all annotations based on vertebra category."""
         if not self._current_annotation:
             return
         for ann in self._current_annotation.annotations:
-            if ann.class_id == 0:  # Vertebra
-                ann.visible = self._show_vertebrae
-            else:  # Spine boxes
-                ann.visible = self._show_spine
+            category = get_vertebra_category(ann.class_id)
+            if category == VertebraCategory.CERVICAL:
+                ann.visible = self._show_cervical
+            elif category == VertebraCategory.THORACIC:
+                ann.visible = self._show_thoracic
+            elif category == VertebraCategory.LUMBAR:
+                ann.visible = self._show_lumbar
+            elif category == VertebraCategory.SACRAL:
+                ann.visible = self._show_sacral
+            else:
+                ann.visible = True  # 未知类别默认可见
         # Update canvas items
         for item in self._canvas._obb_items:
             item.setVisible(item.annotation.visible)
@@ -669,6 +748,161 @@ class MainWindow(QMainWindow):
         # For now, just reload from disk
         # TODO: implement proper undo stack
         pass
+
+    # --- 绘制工具方法 ---
+
+    def _populate_vertebra_combo(self):
+        """填充椎骨类型选择下拉框。"""
+        self._vertebra_combo.clear()
+        groups = [
+            ("── 颈椎 (C) ──", []),
+            (None, [(0, "C7")]),
+            ("── 胸椎 (T) ──", []),
+            (None, [(i, VERTEBRA_CLASSES[i]) for i in range(1, 13)]),
+            ("── 腰椎 (L) ──", []),
+            (None, [(i, VERTEBRA_CLASSES[i]) for i in range(13, 18)]),
+            ("── 骶椎 (S) ──", []),
+            (None, [(18, "S1")]),
+        ]
+        for item in groups:
+            label, entries = item
+            if label is not None:
+                self._vertebra_combo.addItem(label)
+                # 分隔项设为不可选
+                idx = self._vertebra_combo.count() - 1
+                model = self._vertebra_combo.model()
+                model.item(idx).setEnabled(False)
+            else:
+                for class_id, name in entries:
+                    self._vertebra_combo.addItem(name, class_id)
+
+    def _get_selected_vertebra_class_id(self) -> Optional[int]:
+        """获取椎骨下拉框中当前选中的 class_id。"""
+        data = self._vertebra_combo.currentData()
+        if data is not None and isinstance(data, int):
+            return data
+        return None
+
+    def _toggle_draw_mode(self, shape: str):
+        """切换绘制模式。"""
+        self._current_draw_shape = shape
+
+        # 更新按钮选中状态
+        self._btn_draw_select.setChecked(shape == "none")
+        self._btn_draw_rect.setChecked(shape == "rect")
+        self._btn_draw_line.setChecked(shape == "line")
+
+        # 获取当前选择的椎骨类型
+        class_id = self._get_selected_vertebra_class_id() if shape != "none" else None
+        self._current_draw_class_id = class_id
+
+        # 设置画布绘制模式
+        if shape == "none":
+            self._canvas.set_draw_mode(AnnotationCanvas.DRAW_NONE)
+        elif shape == "rect":
+            self._canvas.set_draw_mode(AnnotationCanvas.DRAW_RECT, class_id=class_id)
+        elif shape == "line":
+            self._canvas.set_draw_mode(AnnotationCanvas.DRAW_LINE, class_id=class_id)
+
+    def _on_annotation_created(self, annotation: OBBAnnotation):
+        """画布上绘制完成后回调，将标注添加到当前图片。"""
+        if annotation is None:
+            return
+
+        if not self._current_annotation:
+            return
+
+        # 如果未预设椎骨类别，弹出选择对话框
+        if annotation.class_id < 0 or not annotation.class_name:
+            class_id = self._prompt_vertebra_selection()
+            if class_id is None:
+                return  # 用户取消
+            annotation.class_id = class_id
+            annotation.class_name = VERTEBRA_CLASSES[class_id]
+
+        # 添加到数据模型
+        self._current_annotation.annotations.append(annotation)
+        self._current_annotation.modified = True
+
+        # 添加到画布
+        self._canvas.add_annotation(annotation)
+
+        # 应用图层可见性
+        self._apply_layer_visibility()
+
+        # 切回选择模式
+        self._toggle_draw_mode("none")
+
+        # 选中新创建的标注
+        if self._canvas._obb_items:
+            self._canvas.select_annotation(len(self._canvas._obb_items) - 1)
+
+        self._update_status()
+        if self._current_index >= 0:
+            self._apply_item_style(self._current_index)
+
+    def _prompt_vertebra_selection(self) -> Optional[int]:
+        """弹出椎骨类型选择对话框，返回 class_id 或 None(取消)。"""
+        categories = [
+            "颈椎 (C)",
+            "  C7",
+            "胸椎 (T)",
+            "  T1", "  T2", "  T3", "  T4", "  T5", "  T6",
+            "  T7", "  T8", "  T9", "  T10", "  T11", "  T12",
+            "腰椎 (L)",
+            "  L1", "  L2", "  L3", "  L4", "  L5",
+            "骶椎 (S)",
+            "  S1",
+        ]
+        name, ok = QInputDialog.getItem(
+            self, "选择椎骨类型", "请选择标注的椎骨:", categories, 0, False
+        )
+        if not ok:
+            return None
+        name = name.strip()
+        class_id = get_vertebra_class_id(name)
+        if class_id is not None:
+            return class_id
+        return None
+
+    def _delete_selected_annotation(self):
+        """删除当前选中的标注。"""
+        if not self._current_annotation:
+            return
+
+        sel_idx = self._canvas._current_selection
+        if sel_idx < 0 or sel_idx >= len(self._canvas._obb_items):
+            return
+
+        # 获取原始索引
+        orig_idx = self._canvas._index_map[sel_idx]
+
+        # 确认删除
+        ann = self._canvas._obb_items[sel_idx].annotation
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除标注 \"{ann.class_name}\" 吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # 从数据模型中删除
+        if 0 <= orig_idx < len(self._current_annotation.annotations):
+            self._current_annotation.annotations.pop(orig_idx)
+            self._current_annotation.modified = True
+
+        # 重新加载画布
+        self._canvas.load_image(
+            self._current_annotation.image_path,
+            self._current_annotation.annotations
+        )
+        self._apply_layer_visibility()
+
+        self._update_status()
+        if self._current_index >= 0:
+            self._apply_item_style(self._current_index)
 
     # --- Save Operations ---
 

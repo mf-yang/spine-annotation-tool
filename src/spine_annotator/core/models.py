@@ -2,9 +2,59 @@
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# 椎骨类别定义 (class_id → class_name)
+# ---------------------------------------------------------------------------
+# C7=0, T1~T12=1~12, L1~L5=13~17, S1=18
+VERTEBRA_CLASSES: dict[int, str] = {
+    0:  "C7",
+    1:  "T1",  2:  "T2",  3:  "T3",  4:  "T4",  5:  "T5",
+    6:  "T6",  7:  "T7",  8:  "T8",  9:  "T9",  10: "T10",
+    11: "T11", 12: "T12",
+    13: "L1",  14: "L2",  15: "L3",  16: "L4",  17: "L5",
+    18: "S1",
+}
+
+
+class VertebraCategory:
+    """椎骨大类：颈椎(C) / 胸椎(T) / 腰椎(L) / 骶椎(S)"""
+    CERVICAL  = "cervical"
+    THORACIC  = "thoracic"
+    LUMBAR    = "lumbar"
+    SACRAL    = "sacral"
+
+    CATEGORY_NAMES = {
+        CERVICAL:  "颈椎 (C)",
+        THORACIC:  "胸椎 (T)",
+        LUMBAR:    "腰椎 (L)",
+        SACRAL:    "骶椎 (S)",
+    }
+
+
+def get_vertebra_category(class_id: int) -> Optional[str]:
+    """根据 class_id 返回椎骨大类 (cervical/thoracic/lumbar/sacral)，无效则 None。"""
+    if class_id == 0:
+        return VertebraCategory.CERVICAL
+    elif 1 <= class_id <= 12:
+        return VertebraCategory.THORACIC
+    elif 13 <= class_id <= 17:
+        return VertebraCategory.LUMBAR
+    elif class_id == 18:
+        return VertebraCategory.SACRAL
+    return None
+
+
+def get_vertebra_class_id(class_name: str) -> Optional[int]:
+    """根据椎骨名称（如 'C7', 'T5', 'L3', 'S1'）返回 class_id，无效则 None。"""
+    for cid, cname in VERTEBRA_CLASSES.items():
+        if cname == class_name:
+            return cid
+    return None
 
 
 @dataclass
@@ -25,10 +75,11 @@ class OBBAnnotation:
     """Oriented Bounding Box annotation for a single vertebra.
     
     Stores 4 corner points in clockwise order starting from top-left.
+    shape_type='obb' 时为矩形（4点），shape_type='line' 时为直线（仅前2点有效）。
     """
     class_id: int
     class_name: str
-    points: List[Point]  # 4 corners, clockwise
+    points: List[Point]  # 4 corners (obb) or 2 endpoints (line), clockwise
     center: Point = field(init=False)
     angle: float = field(init=False)  # radians, 0 = horizontal
     width: float = field(init=False)
@@ -43,11 +94,26 @@ class OBBAnnotation:
     #   0 = 不可见 / 推断（图像中肉眼无法看清，根据相邻椎骨推断）
     keypoint_visibility: int = 2
 
+    # 标注形状类型: 'obb'=四点矩形, 'line'=两点直线
+    shape_type: str = "obb"
+
     def __post_init__(self):
         self._update_geometry()
 
     def _update_geometry(self):
         """Recalculate center, angle, width, height from corner points."""
+        if self.shape_type == "line":
+            if len(self.points) < 2:
+                return
+            p0, p1 = self.points[0], self.points[1]
+            self.center = Point((p0.x + p1.x) / 2, (p0.y + p1.y) / 2)
+            self.width = p0.distance_to(p1)
+            self.height = 0.0
+            dx = p1.x - p0.x
+            dy = p1.y - p0.y
+            self.angle = math.atan2(dy, dx)
+            return
+
         if len(self.points) != 4:
             return
         
@@ -82,8 +148,9 @@ class OBBAnnotation:
         self._update_geometry()
 
     def move_corner(self, index: int, new_pos: Point):
-        """Move a specific corner point."""
-        if 0 <= index < 4:
+        """Move a specific corner/endpoint."""
+        max_idx = 2 if self.shape_type == "line" else 4
+        if 0 <= index < max_idx and index < len(self.points):
             self.points[index] = new_pos
             self._update_geometry()
 
@@ -106,6 +173,14 @@ class OBBAnnotation:
             Point(cx - half_w, cy + half_h),  # bottom-left
         ]
         return cls(class_id=class_id, class_name=class_name, points=points)
+
+    @classmethod
+    def from_line(cls, class_id: int, class_name: str,
+                  x1: float, y1: float, x2: float, y2: float) -> "OBBAnnotation":
+        """Create a line annotation (2 endpoints)."""
+        points = [Point(x1, y1), Point(x2, y2)]
+        return cls(class_id=class_id, class_name=class_name,
+                   points=points, shape_type="line")
 
     def to_xywhr(self) -> Tuple[float, float, float, float, float]:
         """Convert to (center_x, center_y, width, height, angle_radians)."""

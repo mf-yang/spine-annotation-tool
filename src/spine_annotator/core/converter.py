@@ -5,18 +5,24 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .models import ImageAnnotation, OBBAnnotation, Point
+from .models import (
+    VERTEBRA_CLASSES, ImageAnnotation, OBBAnnotation, Point,
+    get_vertebra_category,
+)
 
 
 class YOLOConverter:
     """Convert between YOLO formats and internal annotation model."""
 
+    # 旧版 class_id（已废弃，仅用于向后兼容加载）
+    _LEGACY_CLASS_NAMES = {
+        0: "Vertebra",
+        1: "scoliosis spine",
+        2: "normal spine",
+    }
+
     def __init__(self, class_names: Optional[Dict[int, str]] = None):
-        self.class_names = class_names or {
-            0: "Vertebra",
-            1: "scoliosis spine",
-            2: "normal spine",
-        }
+        self.class_names = class_names or VERTEBRA_CLASSES.copy()
 
     def validate_dataset(self, dataset_root: str) -> Tuple[bool, str]:
         """Validate if directory is a valid YOLO dataset.
@@ -158,9 +164,19 @@ class YOLOConverter:
                     if i >= len(states):
                         continue
                     state = states[i]
-                    # 恢复几何（如果 cache 中有完整 4 点坐标）
+                    # 恢复几何（如果 cache 中有完整点坐标）
                     pts = state.get("points")
-                    if (
+                    shape_type = state.get("shape_type", "obb")
+                    if shape_type == "line":
+                        # Line 标注：2 个端点
+                        if (
+                            isinstance(pts, list) and len(pts) == 2
+                            and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts)
+                        ):
+                            ann.points = [Point(float(p[0]), float(p[1])) for p in pts]
+                            ann.shape_type = "line"
+                            ann._update_geometry()
+                    elif (
                         isinstance(pts, list) and len(pts) == 4
                         and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in pts)
                     ):
@@ -203,14 +219,16 @@ class YOLOConverter:
         """从 ImageAnnotation 提取每个标注的可序列化状态，用于写入 cache。
 
         保存的状态：
-          - points: 4 个角点的像素坐标 [[x, y], ...]，保留旋转/移动/角点拖拽编辑结果
+          - points: 4 个角点或 2 个端点的像素坐标 [[x, y], ...]
           - keypoint_visibility: YOLOv8-pose v 字段
+          - shape_type: 'obb' 或 'line'
         """
         states = []
         for ann in annotation.annotations:
             states.append({
                 "points": [[round(p.x, 3), round(p.y, 3)] for p in ann.points],
                 "keypoint_visibility": int(ann.keypoint_visibility),
+                "shape_type": ann.shape_type,
             })
         return states
 
@@ -238,6 +256,17 @@ class YOLOConverter:
                 h = h_norm * img_h
 
                 class_name = self.class_names.get(class_id, f"class_{class_id}")
+
+                # 跳过已废弃的脊柱外框类别 (旧 class_id 1/2)
+                category = get_vertebra_category(class_id)
+                if category is None and class_id not in self.class_names:
+                    # 旧格式：class_id 0 = 泛化 "Vertebra"，直接加载
+                    # 旧格式：class_id 1/2 = 脊柱外框，跳过
+                    if class_id in self._LEGACY_CLASS_NAMES and class_id != 0:
+                        continue
+                    if class_id not in self._LEGACY_CLASS_NAMES:
+                        continue
+
                 ann = OBBAnnotation.from_aabb(class_id, class_name, cx, cy, w, h)
                 annotations.append(ann)
 
@@ -248,6 +277,9 @@ class YOLOConverter:
         """Save annotations in YOLOv8-OBB format.
         
         Format: class_id x1 y1 x2 y2 x3 y3 x4 y4 (normalized)
+        
+        Line 类型标注：将 2 点扩展为退化 OBB（底边与顶边重合），
+        底部两个关键点在 pose 格式中以 v=0 输出，OBB 格式中仍为 4 点。
         """
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)
@@ -264,11 +296,21 @@ class YOLOConverter:
 
         with open(label_path, "w") as f:
             for ann in annotation.annotations:
-                # 4 corner points, normalized
-                coords = []
-                for p in ann.points:
-                    coords.append(f"{p.x / w_img:.6f}")
-                    coords.append(f"{p.y / h_img:.6f}")
+                if ann.shape_type == "line":
+                    # Line 标注：2 点扩展为退化 OBB 4 点
+                    p0, p1 = ann.points[0], ann.points[1]
+                    coords = [
+                        f"{p0.x / w_img:.6f}", f"{p0.y / h_img:.6f}",
+                        f"{p1.x / w_img:.6f}", f"{p1.y / h_img:.6f}",
+                        f"{p1.x / w_img:.6f}", f"{p1.y / h_img:.6f}",
+                        f"{p0.x / w_img:.6f}", f"{p0.y / h_img:.6f}",
+                    ]
+                else:
+                    # OBB 标注：4 角点
+                    coords = []
+                    for p in ann.points:
+                        coords.append(f"{p.x / w_img:.6f}")
+                        coords.append(f"{p.y / h_img:.6f}")
 
                 line = f"{ann.class_id} {' '.join(coords)}\n"
                 f.write(line)
@@ -323,6 +365,8 @@ class YOLOConverter:
             x1,y1 = 左上, x2,y2 = 右上, x3,y3 = 右下, x4,y4 = 左下
         - v: 可见性 (0=不可见, 1=遮挡, 2=可见)
           取自 OBBAnnotation.keypoint_visibility（对该标注 4 个点统一生效），默认 2
+        
+        Line 类型标注：输出 4 个关键点，底部 2 个为 v=0
         """
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)
@@ -339,34 +383,72 @@ class YOLOConverter:
 
         with open(label_path, "w") as f:
             for ann in annotation.annotations:
-                xs = [p.x for p in ann.points]
-                ys = [p.y for p in ann.points]
-                x_min, x_max = min(xs), max(xs)
-                y_min, y_max = min(ys), max(ys)
+                if ann.shape_type == "line":
+                    # Line 标注：2 点 → pose 格式 4 关键点，底部 2 点 v=0
+                    p0, p1 = ann.points[0], ann.points[1]
+                    x_min = min(p0.x, p1.x)
+                    x_max = max(p0.x, p1.x)
+                    y_min = min(p0.y, p1.y)
+                    y_max = max(p0.y, p1.y)
+                    bbox_w = max(x_max - x_min, 1.0)
+                    bbox_h = max(y_max - y_min, 1.0)
+                    bbox_cx = x_min + bbox_w / 2
+                    bbox_cy = y_min + bbox_h / 2
 
-                bbox_w = x_max - x_min
-                bbox_h = y_max - y_min
-                bbox_cx = x_min + bbox_w / 2
-                bbox_cy = y_min + bbox_h / 2
-
-                v = int(ann.keypoint_visibility)
-
-                parts = [
-                    str(ann.class_id),
-                    f"{bbox_cx / w_img:.6f}",
-                    f"{bbox_cy / h_img:.6f}",
-                    f"{bbox_w / w_img:.6f}",
-                    f"{bbox_h / h_img:.6f}",
-                ]
-
-                # Keypoints: 顺时针 左上, 右上, 右下, 左下
-                # OBBAnnotation.points 即按此顺序存储
-                for p in ann.points:
-                    parts.append(f"{p.x / w_img:.6f}")
-                    parts.append(f"{p.y / h_img:.6f}")
+                    parts = [
+                        str(ann.class_id),
+                        f"{bbox_cx / w_img:.6f}",
+                        f"{bbox_cy / h_img:.6f}",
+                        f"{bbox_w / w_img:.6f}",
+                        f"{bbox_h / h_img:.6f}",
+                    ]
+                    v = int(ann.keypoint_visibility)
+                    # 左上、右上：可见(v)
+                    parts.append(f"{p0.x / w_img:.6f}")
+                    parts.append(f"{p0.y / h_img:.6f}")
                     parts.append(str(v))
+                    parts.append(f"{p1.x / w_img:.6f}")
+                    parts.append(f"{p1.y / h_img:.6f}")
+                    parts.append(str(v))
+                    # 右下、左下：不可见(0)
+                    parts.append(f"{p1.x / w_img:.6f}")
+                    parts.append(f"{p1.y / h_img:.6f}")
+                    parts.append("0")
+                    parts.append(f"{p0.x / w_img:.6f}")
+                    parts.append(f"{p0.y / h_img:.6f}")
+                    parts.append("0")
 
-                f.write(" ".join(parts) + "\n")
+                    f.write(" ".join(parts) + "\n")
+                else:
+                    # OBB 标注：原有逻辑
+                    xs = [p.x for p in ann.points]
+                    ys = [p.y for p in ann.points]
+                    x_min, x_max = min(xs), max(xs)
+                    y_min, y_max = min(ys), max(ys)
+
+                    bbox_w = x_max - x_min
+                    bbox_h = y_max - y_min
+                    bbox_cx = x_min + bbox_w / 2
+                    bbox_cy = y_min + bbox_h / 2
+
+                    v = int(ann.keypoint_visibility)
+
+                    parts = [
+                        str(ann.class_id),
+                        f"{bbox_cx / w_img:.6f}",
+                        f"{bbox_cy / h_img:.6f}",
+                        f"{bbox_w / w_img:.6f}",
+                        f"{bbox_h / h_img:.6f}",
+                    ]
+
+                    # Keypoints: 顺时针 左上, 右上, 右下, 左下
+                    # OBBAnnotation.points 即按此顺序存储
+                    for p in ann.points:
+                        parts.append(f"{p.x / w_img:.6f}")
+                        parts.append(f"{p.y / h_img:.6f}")
+                        parts.append(str(v))
+
+                    f.write(" ".join(parts) + "\n")
 
         return True
 

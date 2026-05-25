@@ -1,26 +1,35 @@
 """Interactive image canvas for OBB annotation editing."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import (
     QBrush, QColor, QFont, QPen, QPixmap, QPolygonF, QWheelEvent,
 )
 from PyQt5.QtWidgets import (
-    QGraphicsItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
+    QGraphicsItem, QGraphicsLineItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
     QGraphicsRectItem, QGraphicsScene, QGraphicsSimpleTextItem,
-    QGraphicsView,
+    QGraphicsView, QInputDialog, QMessageBox,
 )
 
-from ..core.models import OBBAnnotation, Point
+from ..core.models import (
+    OBBAnnotation, Point, VertebraCategory, VERTEBRA_CLASSES,
+    get_vertebra_category, get_vertebra_class_id,
+)
 
-# Color palette for different classes
-CLASS_COLORS = [
-    QColor(0, 255, 0, 180),    # green - vertebra
-    QColor(255, 0, 0, 180),    # red - scoliosis spine
-    QColor(0, 100, 255, 180),  # blue - normal spine
-]
+# ---------------------------------------------------------------------------
+# 椎骨大类颜色方案 (C/T/L/S 各一种颜色)
+# ---------------------------------------------------------------------------
+CATEGORY_COLORS = {
+    VertebraCategory.CERVICAL: QColor(0, 220, 255, 200),   # 青色 - 颈椎
+    VertebraCategory.THORACIC: QColor(0, 255, 0, 200),     # 绿色 - 胸椎
+    VertebraCategory.LUMBAR:   QColor(255, 165, 0, 200),   # 橙色 - 腰椎
+    VertebraCategory.SACRAL:   QColor(200, 0, 255, 200),   # 紫色 - 骶椎
+}
+
+# 向后兼容：旧 class_id → 颜色映射（未知类别回退色）
+_DEFAULT_COLOR = QColor(180, 180, 180, 180)  # 灰色
 
 SELECTED_COLOR = QColor(255, 255, 0, 220)  # yellow
 HANDLE_SIZE = 6  # corner handle radius in pixels
@@ -78,19 +87,18 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         return pen
 
     def _get_color(self):
-        """Get color based on annotation class."""
-        return CLASS_COLORS[self.annotation.class_id % len(CLASS_COLORS)]
+        """Get color based on vertebra category (C/T/L/S)."""
+        category = get_vertebra_category(self.annotation.class_id)
+        if category and category in CATEGORY_COLORS:
+            return CATEGORY_COLORS[category]
+        return _DEFAULT_COLOR
 
     def _apply_z_value(self):
-        """Set Z-value based on class type: vertebrae always above spine boxes."""
-        # Vertebrae (class 0) get Z=1000+, spine boxes get Z=1+
-        # Within same class, smaller boxes get slightly higher Z
-        area = max(self.annotation.width * self.annotation.height, 1)
+        """Set Z-value: all vertebrae get high Z (on top), line annotations get slightly lower."""
+        area = max(self.annotation.width * max(self.annotation.height, 1), 1)
         inv_area = 1.0 / area
-        if self.annotation.class_id == 0:  # Vertebra
-            self.setZValue(1000 + inv_area * 100)
-        else:  # Spine boxes
-            self.setZValue(1 + inv_area * 0.1)
+        base_z = 1000 if self.annotation.shape_type == "obb" else 900
+        self.setZValue(base_z + inv_area * 100)
 
     def set_selected(self, selected: bool):
         """Update visual state when selected."""
@@ -98,12 +106,9 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         if selected:
             pen = self._build_pen(SELECTED_COLOR, width=3)
             self.setPen(pen)
-            area = max(self.annotation.width * self.annotation.height, 1)
+            area = max(self.annotation.width * max(self.annotation.height, 1), 1)
             inv_area = 1.0 / area
-            if self.annotation.class_id == 0:
-                self.setZValue(1100 + inv_area * 100)
-            else:
-                self.setZValue(10 + inv_area * 0.1)
+            self.setZValue(1100 + inv_area * 100)
         else:
             color = self._get_color()
             pen = self._build_pen(color, width=2)
@@ -125,7 +130,17 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
         painter.setPen(handle_pen)
         painter.setBrush(handle_brush)
 
-        # Corner handles
+        if self.annotation.shape_type == "line":
+            # Line 标注：只绘制 2 个端点手柄
+            self._handles = []
+            for p in self.annotation.points[:2]:
+                center = QPointF(p.x, p.y)
+                self._handles.append(center)
+                painter.drawEllipse(center, HANDLE_SIZE, HANDLE_SIZE)
+            self._rotate_handle = None
+            return
+
+        # OBB 标注：4 个角点手柄 + 旋转手柄
         self._handles = []
         for p in self.annotation.points:
             center = QPointF(p.x, p.y)
@@ -152,6 +167,18 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
 
     def _draw_label(self, painter):
         """Draw class name label above the box."""
+        if self.annotation.shape_type == "line":
+            p0 = self.annotation.points[0]
+            label = f"{self.annotation.class_name}"
+            v = int(getattr(self.annotation, "keypoint_visibility", 2))
+            if v != 2:
+                v_text = {1: "遮挡", 0: "不可见"}.get(v, "")
+                label += f" [v={v} {v_text}]"
+            painter.setPen(QPen(SELECTED_COLOR))
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            painter.drawText(QPointF(p0.x, p0.y - 8), label)
+            return
+
         p0 = self.annotation.points[0]
         label = f"{self.annotation.class_name} ({math.degrees(self.annotation.angle):.1f}°)"
         v = int(getattr(self.annotation, "keypoint_visibility", 2))
@@ -188,6 +215,12 @@ class AnnotationCanvas(QGraphicsView):
 
     selection_changed = pyqtSignal(int)  # emits annotation index, -1 if none
     annotation_modified = pyqtSignal()
+    annotation_created = pyqtSignal(object)  # emits the newly created OBBAnnotation
+
+    # 绘制模式
+    DRAW_NONE = "none"       # 选择/编辑模式
+    DRAW_RECT = "rect"       # 绘制矩形
+    DRAW_LINE = "line"       # 绘制直线
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -199,10 +232,18 @@ class AnnotationCanvas(QGraphicsView):
         self._current_selection: int = -1
 
         # Drag state
-        self._drag_mode: str = "none"  # 'none', 'corner', 'rotate', 'pan'
+        self._drag_mode: str = "none"  # 'none', 'corner', 'rotate', 'pan', 'draw_rect', 'draw_line'
         self._drag_corner_index: int = -1
         self._drag_start_pos: Optional[QPointF] = None
         self._drag_start_angle: float = 0.0
+
+        # Drawing state
+        self._draw_mode: str = self.DRAW_NONE
+        self._draw_start: Optional[QPointF] = None
+        self._draw_preview_item = None  # 预览图形
+
+        # 当前绘制预设的椎骨 class_id (由 main_window 设置)
+        self._pending_class_id: Optional[int] = None
 
         # Setup view
         from PyQt5.QtGui import QPainter
@@ -215,6 +256,20 @@ class AnnotationCanvas(QGraphicsView):
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+    def set_draw_mode(self, mode: str, class_id: Optional[int] = None):
+        """设置绘制模式 ('none', 'rect', 'line') 及预设椎骨类别。"""
+        self._draw_mode = mode
+        self._pending_class_id = class_id
+        # 切换到绘制模式时取消选中
+        if mode != self.DRAW_NONE:
+            self.select_annotation(-1)
+            if mode == self.DRAW_RECT:
+                self.setCursor(Qt.CrossCursor)
+            elif mode == self.DRAW_LINE:
+                self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
 
     def load_image(self, image_path: str, annotations: List[OBBAnnotation]):
         """Load an image and its annotations into the canvas."""
@@ -294,6 +349,29 @@ class AnnotationCanvas(QGraphicsView):
     # --- Mouse Event Handlers ---
 
     def mousePressEvent(self, event):
+        # --- 绘制模式处理 ---
+        if self._draw_mode != self.DRAW_NONE and event.button() == Qt.LeftButton:
+            scene_pos = self.mapToScene(event.pos())
+            self._draw_start = scene_pos
+            self._drag_mode = f"draw_{self._draw_mode}"
+            # 创建预览图形
+            self._remove_draw_preview()
+            if self._draw_mode == self.DRAW_RECT:
+                self._draw_preview_item = QGraphicsRectItem(
+                    QRectF(scene_pos, scene_pos)
+                )
+                pen = QPen(SELECTED_COLOR, 2, Qt.DashLine)
+                self._draw_preview_item.setPen(pen)
+                self._scene.addItem(self._draw_preview_item)
+            elif self._draw_mode == self.DRAW_LINE:
+                self._draw_preview_item = QGraphicsLineItem(
+                    scene_pos.x(), scene_pos.y(), scene_pos.x(), scene_pos.y()
+                )
+                pen = QPen(SELECTED_COLOR, 2, Qt.DashLine)
+                self._draw_preview_item.setPen(pen)
+                self._scene.addItem(self._draw_preview_item)
+            return
+
         if event.button() == Qt.MiddleButton:
             # Pan
             self._drag_mode = "pan"
@@ -365,6 +443,21 @@ class AnnotationCanvas(QGraphicsView):
             )
             return
 
+        # --- 绘制模式拖拽更新预览 ---
+        if self._drag_mode in ("draw_rect", "draw_line") and self._draw_start:
+            scene_pos = self.mapToScene(event.pos())
+            if self._draw_preview_item:
+                if self._drag_mode == "draw_rect":
+                    rect = QRectF(self._draw_start, scene_pos).normalized()
+                    self._draw_preview_item.setRect(rect)
+                elif self._drag_mode == "draw_line":
+                    self._draw_preview_item.setLine(
+                        self._draw_start.x(), self._draw_start.y(),
+                        scene_pos.x(), scene_pos.y()
+                    )
+            self.viewport().update()
+            return
+
         if self._drag_mode == "none":
             super().mouseMoveEvent(event)
             return
@@ -404,6 +497,15 @@ class AnnotationCanvas(QGraphicsView):
         self.viewport().update()
 
     def mouseReleaseEvent(self, event):
+        # --- 绘制完成 ---
+        if self._drag_mode in ("draw_rect", "draw_line") and self._draw_start:
+            scene_pos = self.mapToScene(event.pos())
+            self._remove_draw_preview()
+            self._finalize_draw(scene_pos)
+            self._drag_mode = "none"
+            self._draw_start = None
+            return
+
         self._drag_mode = "none"
         self._drag_corner_index = -1
         self._drag_start_pos = None
@@ -416,3 +518,64 @@ class AnnotationCanvas(QGraphicsView):
         if event.angleDelta().y() < 0:
             factor = 1.0 / factor
         self.scale(factor, factor)
+
+    # --- 绘制辅助方法 ---
+
+    def _remove_draw_preview(self):
+        """移除绘制预览图形。"""
+        if self._draw_preview_item is not None:
+            self._scene.removeItem(self._draw_preview_item)
+            self._draw_preview_item = None
+
+    def _finalize_draw(self, end_pos: QPointF):
+        """绘制完成后创建标注。"""
+        if self._draw_start is None:
+            return
+
+        start = self._draw_start
+
+        # 检查最小尺寸（避免误点击产生极小标注）
+        dist = math.hypot(end_pos.x() - start.x(), end_pos.y() - start.y())
+        if dist < 5:
+            return
+
+        class_id = self._pending_class_id
+        class_name = VERTEBRA_CLASSES.get(class_id, f"class_{class_id}") if class_id is not None else None
+
+        if self._draw_mode == self.DRAW_RECT:
+            # 矩形：从拖拽区域创建 OBB
+            rect = QRectF(start, end_pos).normalized()
+            cx, cy = rect.center().x(), rect.center().y()
+            w, h = rect.width(), rect.height()
+            if class_id is not None:
+                ann = OBBAnnotation.from_aabb(class_id, class_name, cx, cy, w, h)
+                self.annotation_created.emit(ann)
+            else:
+                # 未预设类别，通知 main_window 弹出选择器
+                ann = OBBAnnotation.from_aabb(-1, "", cx, cy, w, h)
+                self.annotation_created.emit(ann)
+
+        elif self._draw_mode == self.DRAW_LINE:
+            # 直线：从拖拽创建 line 标注
+            if class_id is not None:
+                ann = OBBAnnotation.from_line(
+                    class_id, class_name,
+                    start.x(), start.y(), end_pos.x(), end_pos.y(),
+                )
+                self.annotation_created.emit(ann)
+            else:
+                ann = OBBAnnotation.from_line(
+                    -1, "", start.x(), start.y(), end_pos.x(), end_pos.y(),
+                )
+                self.annotation_created.emit(ann)
+
+    def add_annotation(self, annotation: OBBAnnotation):
+        """将新标注添加到画布并刷新显示。"""
+        if not annotation:
+            return
+        idx = len(self._obb_items)
+        item = OBBGraphicsItem(annotation, idx)
+        self._scene.addItem(item)
+        self._obb_items.append(item)
+        self._index_map.append(idx)
+        self.viewport().update()
