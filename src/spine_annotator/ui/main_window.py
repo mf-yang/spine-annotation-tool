@@ -165,32 +165,22 @@ class MainWindow(QMainWindow):
         draw_row = QHBoxLayout()
         self._btn_draw_rect = QPushButton("矩形")
         self._btn_draw_rect.setCheckable(True)
-        self._btn_draw_rect.setToolTip("拖拽绘制矩形椎骨标注")
+        self._btn_draw_rect.setToolTip("拖拽绘制矩形椎骨标注；绘制完成后弹窗选择椎骨编号")
         self._btn_draw_rect.clicked.connect(lambda: self._toggle_draw_mode("rect"))
         draw_row.addWidget(self._btn_draw_rect)
 
         self._btn_draw_line = QPushButton("直线")
         self._btn_draw_line.setCheckable(True)
-        self._btn_draw_line.setToolTip("拖拽绘制直线椎骨标注 (S1顶部)")
+        self._btn_draw_line.setToolTip("拖拽绘制直线椎骨标注 (S1顶部)；绘制完成后弹窗选择椎骨编号")
         self._btn_draw_line.clicked.connect(lambda: self._toggle_draw_mode("line"))
         draw_row.addWidget(self._btn_draw_line)
 
-        self._btn_draw_select = QPushButton("选择")
-        self._btn_draw_select.setCheckable(True)
-        self._btn_draw_select.setChecked(True)
-        self._btn_draw_select.setToolTip("切回选择/编辑模式")
-        self._btn_draw_select.clicked.connect(lambda: self._toggle_draw_mode("none"))
-        draw_row.addWidget(self._btn_draw_select)
-
         right_layout.addLayout(draw_row)
 
-        # Vertebra type selector for drawing
-        vert_row = QHBoxLayout()
-        vert_row.addWidget(QLabel("椎骨:"))
-        self._vertebra_combo = QComboBox()
-        self._populate_vertebra_combo()
-        vert_row.addWidget(self._vertebra_combo)
-        right_layout.addLayout(vert_row)
+        draw_hint = QLabel("提示: 按 Esc 退出绘制；绘制完成后会弹出椎骨编号选择框")
+        draw_hint.setStyleSheet("color: #888; font-size: 11px;")
+        draw_hint.setWordWrap(True)
+        right_layout.addWidget(draw_hint)
 
         # Delete annotation button
         self._btn_delete_ann = QPushButton("删除选中标注 (Del)")
@@ -839,59 +829,30 @@ class MainWindow(QMainWindow):
         pass
 
     # --- 绘制工具方法 ---
-
-    def _populate_vertebra_combo(self):
-        """填充椎骨类型选择下拉框。"""
-        self._vertebra_combo.clear()
-        groups = [
-            ("── 颈椎 (C) ──", []),
-            (None, [(0, "C7")]),
-            ("── 胸椎 (T) ──", []),
-            (None, [(i, VERTEBRA_CLASSES[i]) for i in range(1, 13)]),
-            ("── 腰椎 (L) ──", []),
-            (None, [(i, VERTEBRA_CLASSES[i]) for i in range(13, 18)]),
-            ("── 骶椎 (S) ──", []),
-            (None, [(18, "S1")]),
-        ]
-        for item in groups:
-            label, entries = item
-            if label is not None:
-                self._vertebra_combo.addItem(label)
-                # 分隔项设为不可选
-                idx = self._vertebra_combo.count() - 1
-                model = self._vertebra_combo.model()
-                model.item(idx).setEnabled(False)
-            else:
-                for class_id, name in entries:
-                    self._vertebra_combo.addItem(name, class_id)
-
-    def _get_selected_vertebra_class_id(self) -> Optional[int]:
-        """获取椎骨下拉框中当前选中的 class_id。"""
-        data = self._vertebra_combo.currentData()
-        if data is not None and isinstance(data, int):
-            return data
-        return None
-
+    
     def _toggle_draw_mode(self, shape: str):
-        """切换绘制模式。"""
+        """切换绘制模式；再次点击同一按钮则退出绘制。
+    
+        方案 B：不预设椎骨类别，绘制完成后统一弹窗选择。
+        """
+        # 重复点击当前模式按钮→退出绘制
+        if self._current_draw_shape == shape and shape != "none":
+            shape = "none"
+    
         self._current_draw_shape = shape
-
-        # 更新按钮选中状态
-        self._btn_draw_select.setChecked(shape == "none")
+        self._current_draw_class_id = None  # 不预设
+    
+        # 同步按钮选中状态
         self._btn_draw_rect.setChecked(shape == "rect")
         self._btn_draw_line.setChecked(shape == "line")
-
-        # 获取当前选择的椎骨类型
-        class_id = self._get_selected_vertebra_class_id() if shape != "none" else None
-        self._current_draw_class_id = class_id
-
-        # 设置画布绘制模式
+    
+        # 设置画布绘制模式（class_id=None，绘制完成后由弹窗选择）
         if shape == "none":
             self._canvas.set_draw_mode(AnnotationCanvas.DRAW_NONE)
         elif shape == "rect":
-            self._canvas.set_draw_mode(AnnotationCanvas.DRAW_RECT, class_id=class_id)
+            self._canvas.set_draw_mode(AnnotationCanvas.DRAW_RECT, class_id=None)
         elif shape == "line":
-            self._canvas.set_draw_mode(AnnotationCanvas.DRAW_LINE, class_id=class_id)
+            self._canvas.set_draw_mode(AnnotationCanvas.DRAW_LINE, class_id=None)
 
     def _on_annotation_created(self, annotation: OBBAnnotation):
         """画布上绘制完成后回调，将标注添加到当前图片。"""
