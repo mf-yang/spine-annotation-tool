@@ -16,11 +16,13 @@ from PyQt5.QtWidgets import (
 
 from .. import __version__
 from ..core.converter import YOLOConverter
+from ..core.image_enhancer import EnhanceParams
 from ..core.models import (
     ImageAnnotation, OBBAnnotation, VERTEBRA_CLASSES,
     VertebraCategory, get_vertebra_category, get_vertebra_class_id,
 )
 from .image_canvas import AnnotationCanvas, CATEGORY_COLORS
+from .enhancement_panel import EnhancementDialog, EnhancementToolbar
 
 
 class MainWindow(QMainWindow):
@@ -112,6 +114,13 @@ class MainWindow(QMainWindow):
         self._canvas.annotation_modified.connect(self._on_annotation_modified)
         self._canvas.annotation_created.connect(self._on_annotation_created)
         self._canvas.annotation_relabel_requested.connect(self._on_relabel_requested)
+
+        # 画布顶部图像增强工具条（不影响原图与标注坐标）
+        self._enhance_toolbar = EnhancementToolbar()
+        self._enhance_toolbar.open_dialog_requested.connect(self._open_enhance_dialog)
+        self._enhance_toolbar.invert_toggled.connect(self._on_enhance_invert_toggled)
+        self._enhance_toolbar.reset_requested.connect(self._reset_enhance_params)
+        self._enhance_dialog: Optional[EnhancementDialog] = None
 
         # --- Right: controls panel ---
         right_panel = QWidget()
@@ -332,8 +341,16 @@ class MainWindow(QMainWindow):
         right_scroll.setFixedWidth(248)
 
         # --- Assemble ---
+        # 中央区域 = 增强工具条 + 画布（垂直堆叠）
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        center_layout.addWidget(self._enhance_toolbar)
+        center_layout.addWidget(self._canvas, stretch=1)
+
         main_layout.addWidget(left_panel)
-        main_layout.addWidget(self._canvas, stretch=1)
+        main_layout.addWidget(center_widget, stretch=1)
         main_layout.addWidget(right_scroll)
 
     def _create_section_label(self, text: str) -> QLabel:
@@ -755,6 +772,9 @@ class MainWindow(QMainWindow):
         if self._current_index >= 0 and self._current_annotation and self._current_annotation.modified:
             self._checkpoint_geometry_to_cache()
 
+        # 切换前：把当前图的增强参数写入缓存（每图独立持久化）
+        self._persist_enhance_params_for_current()
+
         prev_index = self._current_index
         self._current_index = index
         info = self._image_infos[index]
@@ -765,6 +785,15 @@ class MainWindow(QMainWindow):
             info["image_path"], info["label_path"], info["width"], info["height"],
             cache_entry=cache_entry,
         )
+
+        # 加载到画布前，先从 cache 读出该图的增强参数并同步到 canvas / toolbar
+        enhance_params = self._load_enhance_params_for(info["image_path"])
+        self._canvas.set_enhance_params(enhance_params)
+        self._enhance_toolbar.sync_from_params(enhance_params)
+        if self._enhance_dialog is not None and self._enhance_dialog.isVisible():
+            # 如果弹窗仍开着，重建以同步控件初值
+            self._enhance_dialog.close()
+            self._enhance_dialog = None
 
         # Apply layer visibility
         self._apply_layer_visibility()
@@ -1310,6 +1339,81 @@ class MainWindow(QMainWindow):
         existing["modified"] = True
         self._cache[img_path] = existing
         self._converter.save_progress_cache(self._progress_cache_path, self._cache)
+
+    # ---------------- 图像增强（不修改原图，仅辅助显示） ----------------
+
+    def _load_enhance_params_for(self, img_path: str) -> EnhanceParams:
+        """从 cache 读出该图的增强参数，不存在返回默认。"""
+        entry = self._cache.get(img_path, {})
+        return EnhanceParams.from_dict(entry.get("enhance_params", {}))
+
+    def _persist_enhance_params_for_current(self):
+        """把当前画布上的增强参数写入当前图的 cache（只在变化时写盘）。"""
+        if not self._image_infos or self._current_index < 0 or not self._progress_cache_path:
+            return
+        info = self._image_infos[self._current_index]
+        img_path = info["image_path"]
+        cur_params = self._canvas.get_enhance_params()
+        cur_dict = cur_params.to_dict()
+        existing = self._cache.get(img_path, {})
+        old_dict = existing.get("enhance_params")
+        if old_dict == cur_dict:
+            return  # 无变化，跳过写盘
+        # 默认参数不必写入（保持 cache 精简）
+        if cur_params.is_identity():
+            if "enhance_params" in existing:
+                existing.pop("enhance_params", None)
+            else:
+                return
+        else:
+            existing["enhance_params"] = cur_dict
+        self._cache[img_path] = existing
+        self._converter.save_progress_cache(self._progress_cache_path, self._cache)
+
+    def _open_enhance_dialog(self):
+        """打开/复用增强调参弹窗（非模态，边调边看）。"""
+        if not self._image_infos or self._current_index < 0:
+            QMessageBox.information(self, "提示", "请先打开数据集并选择一张图片")
+            return
+        if self._enhance_dialog is not None and self._enhance_dialog.isVisible():
+            self._enhance_dialog.raise_()
+            self._enhance_dialog.activateWindow()
+            return
+        cur = self._canvas.get_enhance_params()
+        self._enhance_dialog = EnhancementDialog(cur, parent=self)
+        self._enhance_dialog.params_changed.connect(self._on_enhance_params_changed)
+        self._enhance_dialog.show()
+
+    def _on_enhance_params_changed(self, params: EnhanceParams):
+        """调参弹窗参数变化 → 同步到 canvas + toolbar，去抖后写缓存。"""
+        self._canvas.set_enhance_params(params)
+        self._enhance_toolbar.sync_from_params(params)
+        # 使用状态栏微提示参数已应用，写盘在切图时统一处理
+        self._persist_enhance_params_for_current()
+
+    def _on_enhance_invert_toggled(self, checked: bool):
+        """工具条反相按钮 → 单独切换。"""
+        cur = self._canvas.get_enhance_params()
+        new = EnhanceParams(
+            brightness=cur.brightness,
+            contrast=cur.contrast,
+            gamma=cur.gamma,
+            clahe=cur.clahe,
+            invert=bool(checked),
+        )
+        self._canvas.set_enhance_params(new)
+        self._enhance_toolbar.sync_from_params(new)
+        self._persist_enhance_params_for_current()
+
+    def _reset_enhance_params(self):
+        """一键将当前图的增强参数恢复为默认。"""
+        default = EnhanceParams()
+        self._canvas.set_enhance_params(default)
+        self._enhance_toolbar.sync_from_params(default)
+        if self._enhance_dialog is not None and self._enhance_dialog.isVisible():
+            self._enhance_dialog.close()
+            self._enhance_dialog = None
+        self._persist_enhance_params_for_current()
 
     def _save_all(self):
         """Export all images that have been processed."""

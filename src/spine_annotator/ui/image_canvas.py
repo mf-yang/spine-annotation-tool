@@ -3,9 +3,12 @@
 import math
 from typing import Callable, List, Optional, Tuple
 
+import cv2
+import numpy as np
+
 from PyQt5.QtCore import QEvent, QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import (
-    QBrush, QColor, QFont, QPen, QPixmap, QPolygonF, QWheelEvent,
+    QBrush, QColor, QFont, QImage, QPen, QPixmap, QPolygonF, QWheelEvent,
 )
 from PyQt5.QtWidgets import (
     QGraphicsItem, QGraphicsLineItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
@@ -13,6 +16,7 @@ from PyQt5.QtWidgets import (
     QGraphicsView, QInputDialog, QMessageBox,
 )
 
+from ..core.image_enhancer import EnhanceParams, apply_enhancement
 from ..core.models import (
     OBBAnnotation, Point, VertebraCategory, VERTEBRA_CLASSES,
     get_vertebra_category, get_vertebra_class_id,
@@ -299,6 +303,11 @@ class AnnotationCanvas(QGraphicsView):
         self._obb_items: List[OBBGraphicsItem] = []
         self._current_selection: int = -1
 
+        # 原始图像缓存（numpy BGR）+ 当前增强参数
+        # 加载时读一次磁盘后常驻内存，参数变化只需重新走增强管线
+        self._original_image: Optional[np.ndarray] = None
+        self._enhance_params: EnhanceParams = EnhanceParams()
+
         # Drag state
         self._drag_mode: str = "none"  # 'none', 'corner', 'rotate', 'pan', 'draw_rect', 'draw_line'
         self._drag_corner_index: int = -1
@@ -339,6 +348,31 @@ class AnnotationCanvas(QGraphicsView):
         else:
             self.setCursor(Qt.ArrowCursor)
 
+    @staticmethod
+    def _numpy_to_pixmap(img: np.ndarray) -> QPixmap:
+        """将 OpenCV BGR / 灰度 numpy 转为 QPixmap。"""
+        if img.ndim == 2:
+            h, w = img.shape
+            qimg = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
+        else:
+            # OpenCV BGR → RGB
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        # copy() 避免 numpy buffer 被 GC 后 Qt 显示异常
+        return QPixmap.fromImage(qimg.copy())
+
+    def set_enhance_params(self, params: EnhanceParams):
+        """更新增强参数并重新渲染底图（不影响标注坐标与缩放）。"""
+        self._enhance_params = params
+        if self._original_image is None or self._pixmap_item is None:
+            return
+        rendered = apply_enhancement(self._original_image, self._enhance_params)
+        self._pixmap_item.setPixmap(self._numpy_to_pixmap(rendered))
+
+    def get_enhance_params(self) -> EnhanceParams:
+        return self._enhance_params
+
     def load_image(self, image_path: str, annotations: List[OBBAnnotation]):
         """Load an image and its annotations into the canvas."""
         self._scene.clear()
@@ -346,13 +380,26 @@ class AnnotationCanvas(QGraphicsView):
         self._index_map = []
         self._current_selection = -1
 
-        # Load image
-        pixmap = QPixmap(image_path)
-        if pixmap.isNull():
-            return
-
-        self._pixmap_item = self._scene.addPixmap(pixmap)
-        self._scene.setSceneRect(QRectF(pixmap.rect()))
+        # 读原始图为 numpy BGR（供增强管线复用）
+        try:
+            img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        except Exception:
+            img = None
+        if img is None:
+            # 降级：直接从 QPixmap 加载（无法增强但仍可显示）
+            pixmap = QPixmap(image_path)
+            if pixmap.isNull():
+                return
+            self._original_image = None
+            self._pixmap_item = self._scene.addPixmap(pixmap)
+            self._scene.setSceneRect(QRectF(pixmap.rect()))
+        else:
+            self._original_image = img
+            pixmap = self._numpy_to_pixmap(
+                apply_enhancement(img, self._enhance_params)
+            )
+            self._pixmap_item = self._scene.addPixmap(pixmap)
+            self._scene.setSceneRect(QRectF(pixmap.rect()))
 
         # Sort annotations by area (large first) for consistent ordering
         sorted_anns = sorted(enumerate(annotations), key=lambda x: x[1].width * x[1].height, reverse=True)
