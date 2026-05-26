@@ -188,7 +188,20 @@ class YOLOConverter:
         return annotation
 
     def _restore_annotation_state(self, ann: OBBAnnotation, state: dict):
-        """从 cache state 恢复单个标注的几何与可见性状态。"""
+        """从 cache state 恢复单个标注的类别、几何与可见性状态。
+
+        必须同时恢复 class_id/class_name，否则用户修改编号后未保存就切图，
+        再切回时会丢失编号修改（因为 .txt 未更新而 cache 已更新）。
+        """
+        # 恢复类别编号（优先以 cache 为准，因为用户可能已改编号但未导出 .txt）
+        cached_class_id = state.get("class_id")
+        cached_class_name = state.get("class_name")
+        if cached_class_id is not None:
+            ann.class_id = int(cached_class_id)
+        if cached_class_name is not None:
+            ann.class_name = str(cached_class_name)
+
+        # 恢复几何
         pts = state.get("points")
         shape_type = state.get("shape_type", "obb")
         if shape_type == "line":
@@ -624,8 +637,11 @@ class YOLOConverter:
         w_img = annotation.image_width
         h_img = annotation.image_height
 
+        # 按 class_id 升序导出，保证 .txt 中椎骨按 C7→T1→...→S1 顺序排列
+        sorted_annotations = sorted(annotation.annotations, key=lambda a: a.class_id)
+
         with open(label_path, "w") as f:
-            for ann in annotation.annotations:
+            for ann in sorted_annotations:
                 if ann.shape_type == "line":
                     # Line 标注：2 点 → pose 格式 4 关键点，底部 2 点 v=0
                     p0, p1 = ann.points[0], ann.points[1]
