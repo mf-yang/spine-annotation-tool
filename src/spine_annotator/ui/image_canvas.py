@@ -66,17 +66,21 @@ class OBBGraphicsItem(QGraphicsPolygonItem):
 
         self.setPolygon(poly)
 
-        # Visibility control
-        self.setVisible(self.annotation.visible)
-        if not self.annotation.visible:
-            return
-
-        color = self._get_color()
-        pen = self._build_pen(color, width=2)
+        # 先设置颜色与画笔，再切换可见性。
+        # 这样即使处于隐藏状态中重建 item（例如 reload_annotations），
+        # 后续重新显示时也能看到正确的椎骨分类颜色，避免默认黑色画笔。
+        if self._selected:
+            color = SELECTED_COLOR
+            pen = self._build_pen(color, width=3)
+        else:
+            color = self._get_color()
+            pen = self._build_pen(color, width=2)
         self.setPen(pen)
         self.setBrush(QBrush(QColor(0, 0, 0, 0)))
-        # Restore Z-value based on class (not selection)
         self._apply_z_value()
+
+        # Visibility control （放在最后，不影响 pen/brush 设置）
+        self.setVisible(self.annotation.visible)
 
     def _build_pen(self, color: QColor, width: int) -> QPen:
         """根据 keypoint_visibility 决定线型：v=2 实线，v=1 短虚线，v=0 长虚线。
