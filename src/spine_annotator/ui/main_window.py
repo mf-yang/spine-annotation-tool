@@ -11,7 +11,8 @@ from PyQt5.QtWidgets import (
     QAction, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QRadioButton, QScrollArea, QShortcut, QTextBrowser, QVBoxLayout, QWidget,
+    QRadioButton, QScrollArea, QShortcut, QSpinBox, QTextBrowser, QVBoxLayout,
+    QWidget,
 )
 
 from .. import __version__
@@ -1421,9 +1422,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先设置输出目录")
             return
 
+        opts = self._ask_save_all_options()
+        if not opts:
+            return
+
+        export_mode = opts["mode"]
+        enforce_min_count = bool(opts["enforce_min_count"])
+        min_count = int(opts["min_count"])
+
         count = 0
         skipped_incomplete = 0
         skipped_unsaved_new = 0
+        skipped_min_count = 0
         for i, info in enumerate(self._image_infos):
             img_path = info["image_path"]
             label_path = info.get("label_path")
@@ -1433,11 +1443,13 @@ class MainWindow(QMainWindow):
             has_label = bool(label_path) and Path(label_path).exists()
 
             # 导出条件：
-            # 1) 当前图片
-            # 2) 历史上已保存过（cache.saved=True）
-            # 3) 磁盘已有 label 文件（老数据迁移场景）
+            # - 导出已标注：仅导出在本工具中已正式保存过的图片
+            # - 导出全部：导出已保存 + 磁盘已有 label（老数据迁移）
             cache_saved = bool(cache_entry.get("saved"))
-            should_export = cache_saved or has_label
+            if export_mode == "annotated":
+                should_export = cache_saved
+            else:
+                should_export = cache_saved or has_label
 
             # 防止误把“仅缓存中的未完成新标注”（无历史 label 且未正式保存）导出为已完成
             if not should_export:
@@ -1461,6 +1473,10 @@ class MainWindow(QMainWindow):
                 )
 
             if ann is None:
+                continue
+
+            if enforce_min_count and len(ann.annotations) < min_count:
+                skipped_min_count += 1
                 continue
 
             # 与单张保存一致：每张图片最多只能有 1 个 S1
@@ -1500,12 +1516,78 @@ class MainWindow(QMainWindow):
         for i in range(len(self._image_infos)):
             self._apply_item_style(i)
 
-        msg = f"已导出 {count} 个标注文件"
+        mode_text = "导出已标注" if export_mode == "annotated" else "导出全部"
+        msg = f"{mode_text}：已导出 {count} 个标注文件"
+        if skipped_min_count > 0:
+            msg += f"（跳过 {skipped_min_count} 张：标注数 < {min_count}）"
         if skipped_incomplete > 0:
             msg += f"（跳过 {skipped_incomplete} 张：S1 数量异常）"
         if skipped_unsaved_new > 0:
             msg += f"（未导出 {skipped_unsaved_new} 张未正式保存的新标注）"
         self.statusBar().showMessage(msg)
+
+    def _ask_save_all_options(self) -> Optional[dict]:
+        """弹出“全部导出”选项对话框。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("全部导出选项")
+        dlg.setModal(True)
+        dlg.resize(420, 220)
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("请选择导出范围："))
+
+        rb_annotated = QRadioButton("导出已标注")
+        rb_all = QRadioButton("导出全部")
+        rb_annotated.setChecked(True)
+        layout.addWidget(rb_annotated)
+        layout.addWidget(rb_all)
+
+        min_count_row = QHBoxLayout()
+        chk_min_count = QCheckBox("检查标注数量不少于")
+        chk_min_count.setChecked(True)
+        spn_min_count = QSpinBox()
+        spn_min_count.setRange(1, 999)
+        spn_min_count.setValue(18)
+        lbl_suffix = QLabel("个")
+        min_count_row.addWidget(chk_min_count)
+        min_count_row.addWidget(spn_min_count)
+        min_count_row.addWidget(lbl_suffix)
+        min_count_row.addStretch(1)
+        layout.addLayout(min_count_row)
+
+        hint = QLabel(
+            "提示：\n"
+            "- 导出已标注：仅导出本工具里已正式保存过的图片\n"
+            "- 导出全部：额外包含磁盘原有 label，适合老数据迁移\n"
+            "- 标注数量检查对两种导出范围都生效"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(self._muted_text_style(11))
+        layout.addWidget(hint)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        layout.addWidget(btn_box)
+
+        def _sync_min_count_enabled():
+            spn_enabled = chk_min_count.isChecked()
+            spn_min_count.setEnabled(spn_enabled)
+            lbl_suffix.setEnabled(spn_enabled)
+
+        rb_annotated.toggled.connect(_sync_min_count_enabled)
+        chk_min_count.toggled.connect(_sync_min_count_enabled)
+        _sync_min_count_enabled()
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+
+        use_annotated = rb_annotated.isChecked()
+        return {
+            "mode": "annotated" if use_annotated else "all",
+            "enforce_min_count": bool(chk_min_count.isChecked()),
+            "min_count": int(spn_min_count.value()),
+        }
 
     # --- 清空标注数据 ---
 
