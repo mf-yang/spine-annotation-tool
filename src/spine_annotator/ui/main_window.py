@@ -1422,39 +1422,76 @@ class MainWindow(QMainWindow):
             return
 
         count = 0
+        skipped_incomplete = 0
+        skipped_unsaved_new = 0
         for i, info in enumerate(self._image_infos):
-            # Only save if in cache or currently loaded
             img_path = info["image_path"]
-            if img_path in self._cache or i == self._current_index:
-                # Load if not current
-                if i != self._current_index:
-                    ann = self._converter.load_single(
-                        info["image_path"], info["label_path"],
-                        info["width"], info["height"]
-                    )
-                else:
-                    ann = self._current_annotation
+            label_path = info.get("label_path")
+            cache_entry = self._cache.get(img_path, {})
 
-                # Compute split-aware output directory
-                split = info.get("split", "")
-                if split:
-                    out_dir = os.path.join(self._output_dir, split, "labels")
-                else:
-                    out_dir = self._output_dir
+            is_current = (i == self._current_index)
+            has_label = bool(label_path) and Path(label_path).exists()
 
-                if self._export_format == "yolov8_obb":
-                    self._converter.save_obb_yolov8(ann, out_dir, overwrite=True)
-                elif self._export_format == "yolov8_xywhr":
-                    self._converter.save_obb_xywhr(ann, out_dir, overwrite=True)
-                else:  # yolov8_pose
-                    self._converter.save_pose_yolov8(ann, out_dir, overwrite=True)
+            # 导出条件：
+            # 1) 当前图片
+            # 2) 历史上已保存过（cache.saved=True）
+            # 3) 磁盘已有 label 文件（老数据迁移场景）
+            cache_saved = bool(cache_entry.get("saved"))
+            should_export = cache_saved or has_label
 
-                self._cache[img_path] = {
-                    "modified": False,
-                    "saved": True,
-                    "annotation_states": self._converter.build_annotation_states(ann),
-                }
-                count += 1
+            # 防止误把“仅缓存中的未完成新标注”（无历史 label 且未正式保存）导出为已完成
+            if not should_export:
+                if cache_entry.get("modified"):
+                    skipped_unsaved_new += 1
+                elif (
+                    is_current
+                    and self._current_annotation is not None
+                    and self._current_annotation.modified
+                ):
+                    skipped_unsaved_new += 1
+                continue
+
+            if is_current:
+                ann = self._current_annotation
+            else:
+                ann = self._converter.load_single(
+                    info["image_path"], label_path,
+                    info["width"], info["height"],
+                    cache_entry=self._cache.get(img_path),
+                )
+
+            if ann is None:
+                continue
+
+            # 与单张保存一致：每张图片最多只能有 1 个 S1
+            s1_count = sum(1 for a in ann.annotations if a.class_id == 18)
+            if s1_count > 1:
+                skipped_incomplete += 1
+                continue
+
+            # Compute split-aware output directory
+            split = info.get("split", "")
+            if split:
+                out_dir = os.path.join(self._output_dir, split, "labels")
+            else:
+                out_dir = self._output_dir
+
+            if self._export_format == "yolov8_obb":
+                self._converter.save_obb_yolov8(ann, out_dir, overwrite=True)
+            elif self._export_format == "yolov8_xywhr":
+                self._converter.save_obb_xywhr(ann, out_dir, overwrite=True)
+            else:  # yolov8_pose
+                self._converter.save_pose_yolov8(ann, out_dir, overwrite=True)
+
+            # 合并更新 cache，保留 flagged/enhance_params 等字段
+            updated = dict(cache_entry)
+            updated.update({
+                "modified": False,
+                "saved": True,
+                "annotation_states": self._converter.build_annotation_states(ann),
+            })
+            self._cache[img_path] = updated
+            count += 1
 
         # Save cache
         self._converter.save_progress_cache(self._progress_cache_path, self._cache)
@@ -1463,7 +1500,12 @@ class MainWindow(QMainWindow):
         for i in range(len(self._image_infos)):
             self._apply_item_style(i)
 
-        self.statusBar().showMessage(f"已导出 {count} 个标注文件")
+        msg = f"已导出 {count} 个标注文件"
+        if skipped_incomplete > 0:
+            msg += f"（跳过 {skipped_incomplete} 张：S1 数量异常）"
+        if skipped_unsaved_new > 0:
+            msg += f"（未导出 {skipped_unsaved_new} 张未正式保存的新标注）"
+        self.statusBar().showMessage(msg)
 
     # --- 清空标注数据 ---
 
