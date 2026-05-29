@@ -58,6 +58,9 @@ class MainWindow(QMainWindow):
         # Current loaded annotation (only one at a time)
         self._current_annotation: Optional[ImageAnnotation] = None
         self._cache: dict = {}  # progress cache
+
+        # 标注数量全局检测结果（存放检测不通过的图片 index）
+        self._count_check_failed: set = set()
         
         # Layer visibility
         self._show_cervical = True
@@ -402,6 +405,11 @@ class MainWindow(QMainWindow):
 
         tools_menu.addSeparator()
 
+        act_check_count = QAction("检测标注数量…", self)
+        act_check_count.setStatusTip("全局扫描所有图片，检测标注数量是否符合要求")
+        act_check_count.triggered.connect(self._check_annotation_counts)
+        tools_menu.addAction(act_check_count)
+
         act_clear_all = QAction("清空所有标注…", self)
         act_clear_all.setStatusTip("删除进度缓存与当前 split 的训练标注文件（不可恢复）")
         act_clear_all.triggered.connect(self._clear_all_data)
@@ -683,6 +691,9 @@ class MainWindow(QMainWindow):
 
         # Load progress cache
         self._cache = self._converter.load_progress_cache(self._progress_cache_path)
+
+        # 重置检测结果（新数据集加载时清空旧的警告标记）
+        self._count_check_failed.clear()
 
         # Populate list (颜色按缓存状态决定)
         self._image_list_widget.clear()
@@ -1924,15 +1935,129 @@ class MainWindow(QMainWindow):
 
     # --- 列表项三态视觉样式 ---
 
+    def _check_annotation_counts(self):
+        """全局检测标注数量，弹对话框配置检测参数，结果以警告标记显示在图片列表。"""
+        if not self._image_infos:
+            QMessageBox.information(self, "提示", "请先加载图片数据集。")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("检测标注数量")
+        dlg.setModal(True)
+        dlg.resize(420, 220)
+
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("请选择检测范围和标准数量："))
+
+        chk_annotated = QCheckBox("已标注的图片")
+        chk_annotated.setChecked(True)
+        chk_unannotated = QCheckBox("未标注的图片")
+        chk_unannotated.setChecked(False)
+
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(chk_annotated)
+        scope_row.addWidget(chk_unannotated)
+        scope_row.addStretch(1)
+        layout.addLayout(scope_row)
+
+        count_row = QHBoxLayout()
+        count_row.addWidget(QLabel("标准标注数量："))
+        spn_count = QSpinBox()
+        spn_count.setRange(1, 999)
+        spn_count.setValue(19)
+        count_row.addWidget(spn_count)
+        count_row.addWidget(QLabel("个"))
+        count_row.addStretch(1)
+        layout.addLayout(count_row)
+
+        hint = QLabel(
+            "提示：检测不通过的图片将在左侧列表中以红色 ⚠ 标记。\n"
+            "已标注：在本工具中已正式保存的图片。\n"
+            "未标注：尚未保存过的图片（含磁盘原有 label）。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(self._muted_text_style(11))
+        layout.addWidget(hint)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        layout.addWidget(btn_box)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        check_annotated = chk_annotated.isChecked()
+        check_unannotated = chk_unannotated.isChecked()
+        if not check_annotated and not check_unannotated:
+            QMessageBox.information(self, "提示", "请至少勾选一种检测范围。")
+            return
+
+        target_count = int(spn_count.value())
+
+        # 执行检测
+        self._count_check_failed.clear()
+        checked = 0
+        failed = 0
+
+        for i, info in enumerate(self._image_infos):
+            img_path = info["image_path"]
+            is_saved = self._is_saved(img_path)
+
+            # 根据筛选条件决定是否检测
+            if is_saved and not check_annotated:
+                continue
+            if not is_saved and not check_unannotated:
+                continue
+
+            # 计算标注数量
+            # 优先读 cache annotation_states；其次从磁盘加载 label
+            cache_entry = self._cache.get(img_path, {})
+            states = cache_entry.get("annotation_states")
+            if states is not None:
+                ann_count = len(states)
+            elif info.get("label_path") and Path(info["label_path"]).exists():
+                # 从磁盘 label 文件读取（受 _load_labels 19 个上限保护）
+                try:
+                    ann = self._converter.load_single(
+                        img_path, info["label_path"],
+                        info["width"], info["height"],
+                        cache_entry=None,
+                    )
+                    ann_count = len(ann.annotations)
+                except Exception:
+                    ann_count = 0
+            else:
+                ann_count = 0
+
+            checked += 1
+            if ann_count != target_count:
+                self._count_check_failed.add(i)
+                failed += 1
+
+        # 刷新所有列表项样式
+        for i in range(len(self._image_infos)):
+            self._apply_item_style(i)
+
+        passed = checked - failed
+        self.statusBar().showMessage(
+            f"检测完成：扫描 {checked} 张，"
+            f"符合标准（{target_count} 个） {passed} 张，"
+            f"不符合 {failed} 张"
+            f"（已用红色 ⚠ 标记）",
+            6000,
+        )
+
     def _apply_item_style(self, index: int):
         """更新单个列表项的颜色 + 加粗状态。
-
+    
         状态颜色（自动适配深 / 浅色主题）：
           - 已修改未保存：橙色（高饱和度，醒目提示）
           - 已保存：使用系统 Disabled 文本色（灰色，表示已完成）
           - 有标注(未保存)：系统 Active 文本色
           - 未标注：系统 Active 文本色
           - 已标记难点：前面加 ⚑ 前缀
+          - 数量检测不通过：前面加红色 ⚠ 前缀，红色文字
         当前选中项额外加粗。
         """
         if not (0 <= index < self._image_list_widget.count()):
@@ -1940,7 +2065,7 @@ class MainWindow(QMainWindow):
         item = self._image_list_widget.item(index)
         if item is None:
             return
-
+    
         info = self._image_infos[index]
         img_path = info["image_path"]
         is_current = (index == self._current_index)
@@ -1951,28 +2076,36 @@ class MainWindow(QMainWindow):
         )
         is_saved = self._is_saved(img_path)
         is_flagged = self._is_flagged(img_path)
-
-        # 更新显示文本（加 ⚑ 前缀表示标记难点）
+        is_count_failed = index in self._count_check_failed
+    
+        # 更新显示文本（加前缀表示特殊状态）
         name = Path(info["image_path"]).stem
         split = info.get("split", "")
-        display = f"⚑ [{split}] {name}" if (is_flagged and split) else (
-            f"⚑ {name}" if is_flagged else (
-                f"[{split}] {name}" if split else name
-            )
-        )
+        # 基础前缀：难度标记 + 数量警告
+        prefix_parts = []
+        if is_flagged:
+            prefix_parts.append("⚑")
+        if is_count_failed:
+            prefix_parts.append("⚠")
+        prefix = " ".join(prefix_parts) + " " if prefix_parts else ""
+        split_part = f"[{split}] " if split else ""
+        display = f"{prefix}{split_part}{name}"
         item.setText(display)
-
+    
         palette = self._image_list_widget.palette()
-        if is_modified:
+        if is_count_failed:
+            # 红色：数量检测不通过，最醒目
+            item.setForeground(QBrush(QColor("#e03131")))
+        elif is_modified:
             # 橙色：醒目提示有未保存修改
             item.setForeground(QBrush(QColor("#e8590c")))
         elif is_saved:
-            # 系统 Disabled 文本色（自动深浅模式适配）
+            # 系统Disabled 文本色（自动深浅模式适配）
             item.setForeground(palette.brush(QPalette.Disabled, QPalette.Text))
         else:
             # 系统默认文本色
             item.setForeground(palette.brush(QPalette.Active, QPalette.Text))
-
+    
         font = item.font()
         font.setBold(is_current)
         item.setFont(font)
