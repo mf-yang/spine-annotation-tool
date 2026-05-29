@@ -35,6 +35,8 @@ class MainWindow(QMainWindow):
     SETTINGS_LAST_FORMAT = "last_export_format"  # 字符串：yolov8_obb / yolov8_xywhr / yolov8_pose
     SETTINGS_SAVE_MIN_COUNT_ENABLED = "save_min_count_enabled"
     SETTINGS_SAVE_MIN_COUNT_VALUE = "save_min_count_value"
+    SETTINGS_SAVE_MAX_COUNT_ENABLED = "save_max_count_enabled"
+    SETTINGS_SAVE_MAX_COUNT_VALUE = "save_max_count_value"
 
     def __init__(self):
         super().__init__()
@@ -73,6 +75,12 @@ class MainWindow(QMainWindow):
         )
         self._save_min_count_value = int(
             self._settings.value(self.SETTINGS_SAVE_MIN_COUNT_VALUE, 19, type=int)
+        )
+        self._save_max_count_enabled = bool(
+            self._settings.value(self.SETTINGS_SAVE_MAX_COUNT_ENABLED, True, type=bool)
+        )
+        self._save_max_count_value = int(
+            self._settings.value(self.SETTINGS_SAVE_MAX_COUNT_VALUE, 19, type=int)
         )
 
         self._init_ui()
@@ -441,24 +449,42 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("通用设置")
         dlg.setModal(True)
-        dlg.resize(460, 200)
+        dlg.resize(460, 240)
 
         layout = QVBoxLayout(dlg)
 
+        # --- 最少标注数量 ---
         chk_save_min_count = QCheckBox("保存时检查标注数量不少于")
         chk_save_min_count.setChecked(self._save_min_count_enabled)
 
-        row = QHBoxLayout()
-        row.addWidget(chk_save_min_count)
+        row_min = QHBoxLayout()
+        row_min.addWidget(chk_save_min_count)
         spn_save_min_count = QSpinBox()
         spn_save_min_count.setRange(1, 999)
         spn_save_min_count.setValue(max(1, int(self._save_min_count_value)))
-        row.addWidget(spn_save_min_count)
-        row.addWidget(QLabel("个"))
-        row.addStretch(1)
-        layout.addLayout(row)
+        row_min.addWidget(spn_save_min_count)
+        row_min.addWidget(QLabel("个"))
+        row_min.addStretch(1)
+        layout.addLayout(row_min)
 
-        hint = QLabel("默认启用，默认值 19。关闭后，保存当前时不再校验标注数量。")
+        # --- 最多标注数量 ---
+        chk_save_max_count = QCheckBox("保存时检查标注数量不多于")
+        chk_save_max_count.setChecked(self._save_max_count_enabled)
+
+        row_max = QHBoxLayout()
+        row_max.addWidget(chk_save_max_count)
+        spn_save_max_count = QSpinBox()
+        spn_save_max_count.setRange(1, 999)
+        spn_save_max_count.setValue(max(1, int(self._save_max_count_value)))
+        row_max.addWidget(spn_save_max_count)
+        row_max.addWidget(QLabel("个"))
+        row_max.addStretch(1)
+        layout.addLayout(row_max)
+
+        hint = QLabel(
+            "默认均启用，默认值 19（C7~S1 全部椎骨数量）。\n"
+            "关闭后，保存/导出时不再校验对应方向的数量限制。"
+        )
         hint.setWordWrap(True)
         hint.setStyleSheet(self._muted_text_style(11))
         layout.addWidget(hint)
@@ -470,8 +496,10 @@ class MainWindow(QMainWindow):
 
         def _sync_enabled():
             spn_save_min_count.setEnabled(chk_save_min_count.isChecked())
+            spn_save_max_count.setEnabled(chk_save_max_count.isChecked())
 
         chk_save_min_count.toggled.connect(_sync_enabled)
+        chk_save_max_count.toggled.connect(_sync_enabled)
         _sync_enabled()
 
         if dlg.exec_() != QDialog.Accepted:
@@ -479,8 +507,12 @@ class MainWindow(QMainWindow):
 
         self._save_min_count_enabled = bool(chk_save_min_count.isChecked())
         self._save_min_count_value = int(spn_save_min_count.value())
+        self._save_max_count_enabled = bool(chk_save_max_count.isChecked())
+        self._save_max_count_value = int(spn_save_max_count.value())
         self._settings.setValue(self.SETTINGS_SAVE_MIN_COUNT_ENABLED, self._save_min_count_enabled)
         self._settings.setValue(self.SETTINGS_SAVE_MIN_COUNT_VALUE, self._save_min_count_value)
+        self._settings.setValue(self.SETTINGS_SAVE_MAX_COUNT_ENABLED, self._save_max_count_enabled)
+        self._settings.setValue(self.SETTINGS_SAVE_MAX_COUNT_VALUE, self._save_max_count_value)
         self.statusBar().showMessage("通用设置已保存", 2500)
 
     def _build_shortcut_html(self) -> str:
@@ -1338,7 +1370,19 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(
                         self, "保存失败",
                         f"当前图片标注数量为 {ann_count}，少于设置要求的 {min_count}。\n"
-                        "请补充标注，或在“工具 -> 通用设置”中调整该规则。"
+                        '请补充标注，或在“工具 -> 通用设置”中调整该规则。'
+                    )
+                return
+        
+        if self._save_max_count_enabled:
+            ann_count = len(self._current_annotation.annotations)
+            max_count = max(1, int(self._save_max_count_value))
+            if ann_count > max_count:
+                if not silent:
+                    QMessageBox.warning(
+                        self, "保存失败",
+                        f"当前图片标注数量为 {ann_count}，超过设置限制的 {max_count}。\n"
+                        '请删除多余标注，或在“工具 -> 通用设置”中调整该规则。'
                     )
                 return
 
@@ -1505,11 +1549,14 @@ class MainWindow(QMainWindow):
         export_mode = opts["mode"]
         enforce_min_count = bool(opts["enforce_min_count"])
         min_count = int(opts["min_count"])
+        enforce_max_count = bool(opts["enforce_max_count"])
+        max_count = int(opts["max_count"])
 
         count = 0
         skipped_incomplete = 0
         skipped_unsaved_new = 0
         skipped_min_count = 0
+        skipped_max_count = 0
         for i, info in enumerate(self._image_infos):
             img_path = info["image_path"]
             label_path = info.get("label_path")
@@ -1555,6 +1602,10 @@ class MainWindow(QMainWindow):
                 skipped_min_count += 1
                 continue
 
+            if enforce_max_count and len(ann.annotations) > max_count:
+                skipped_max_count += 1
+                continue
+
             # 与单张保存一致：每张图片最多只能有 1 个 S1
             s1_count = sum(1 for a in ann.annotations if a.class_id == 18)
             if s1_count > 1:
@@ -1596,6 +1647,8 @@ class MainWindow(QMainWindow):
         msg = f"{mode_text}：已导出 {count} 个标注文件"
         if skipped_min_count > 0:
             msg += f"（跳过 {skipped_min_count} 张：标注数 < {min_count}）"
+        if skipped_max_count > 0:
+            msg += f"（跳过 {skipped_max_count} 张：标注数 > {max_count}）"
         if skipped_incomplete > 0:
             msg += f"（跳过 {skipped_incomplete} 张：S1 数量异常）"
         if skipped_unsaved_new > 0:
@@ -1624,12 +1677,25 @@ class MainWindow(QMainWindow):
         spn_min_count = QSpinBox()
         spn_min_count.setRange(1, 999)
         spn_min_count.setValue(19)
-        lbl_suffix = QLabel("个")
+        lbl_min_suffix = QLabel("个")
         min_count_row.addWidget(chk_min_count)
         min_count_row.addWidget(spn_min_count)
-        min_count_row.addWidget(lbl_suffix)
+        min_count_row.addWidget(lbl_min_suffix)
         min_count_row.addStretch(1)
         layout.addLayout(min_count_row)
+
+        max_count_row = QHBoxLayout()
+        chk_max_count = QCheckBox("检查标注数量不多于")
+        chk_max_count.setChecked(True)
+        spn_max_count = QSpinBox()
+        spn_max_count.setRange(1, 999)
+        spn_max_count.setValue(19)
+        lbl_max_suffix = QLabel("个")
+        max_count_row.addWidget(chk_max_count)
+        max_count_row.addWidget(spn_max_count)
+        max_count_row.addWidget(lbl_max_suffix)
+        max_count_row.addStretch(1)
+        layout.addLayout(max_count_row)
 
         hint = QLabel(
             "提示：\n"
@@ -1646,14 +1712,18 @@ class MainWindow(QMainWindow):
         btn_box.rejected.connect(dlg.reject)
         layout.addWidget(btn_box)
 
-        def _sync_min_count_enabled():
-            spn_enabled = chk_min_count.isChecked()
-            spn_min_count.setEnabled(spn_enabled)
-            lbl_suffix.setEnabled(spn_enabled)
+        def _sync_count_enabled():
+            min_on = chk_min_count.isChecked()
+            spn_min_count.setEnabled(min_on)
+            lbl_min_suffix.setEnabled(min_on)
+            max_on = chk_max_count.isChecked()
+            spn_max_count.setEnabled(max_on)
+            lbl_max_suffix.setEnabled(max_on)
 
-        rb_annotated.toggled.connect(_sync_min_count_enabled)
-        chk_min_count.toggled.connect(_sync_min_count_enabled)
-        _sync_min_count_enabled()
+        rb_annotated.toggled.connect(_sync_count_enabled)
+        chk_min_count.toggled.connect(_sync_count_enabled)
+        chk_max_count.toggled.connect(_sync_count_enabled)
+        _sync_count_enabled()
 
         if dlg.exec_() != QDialog.Accepted:
             return None
@@ -1663,6 +1733,8 @@ class MainWindow(QMainWindow):
             "mode": "annotated" if use_annotated else "all",
             "enforce_min_count": bool(chk_min_count.isChecked()),
             "min_count": int(spn_min_count.value()),
+            "enforce_max_count": bool(chk_max_count.isChecked()),
+            "max_count": int(spn_max_count.value()),
         }
 
     # --- 清空标注数据 ---
